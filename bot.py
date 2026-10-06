@@ -44,8 +44,8 @@ class Bot:
     def __init__(self):
         self.token = os.environ['TELEGRAM_BOT_TOKEN']
         self.key = os.environ['OPENAI_API_KEY']
-        self.chat = int(os.environ['TELEGRAM_CHAT_ID'])
-        self.owner = int(os.environ['OWNER_TELEGRAM_USER_ID'])
+        self.chat = int(os.getenv('TELEGRAM_CHAT_ID') or '0')
+        self.owner = int(os.getenv('OWNER_TELEGRAM_USER_ID') or '0')
         self.model = os.environ['OPENAI_MODEL']
         self.max_calls = int(os.getenv('MAX_DAILY_CALLS', '10'))
         self.auto = os.getenv('AUTO_ANALYZE', 'false').lower() == 'true'
@@ -171,10 +171,19 @@ class Bot:
         self.send(self.ai([{'type':'input_text','text':prompt}]))
 
     def handle(self, m):
-        if m.get('chat',{}).get('id') != self.chat or m.get('from',{}).get('is_bot'):
+        if m.get('from',{}).get('is_bot'):
             return
         text = m.get('text', '')
         cmd = command(text)
+        # Before configuration, disclose only this message's IDs. Never save
+        # content, adopt an owner/group, or call AI until BOTH IDs are set.
+        if not self.chat or not self.owner:
+            if cmd == '/id' and m.get('chat', {}).get('id') and m.get('from', {}).get('id'):
+                self.tg('sendMessage', chat_id=m['chat']['id'],
+                        text=f"Chat ID: {m['chat']['id']}\nUser ID: {m['from']['id']}\nСозлаш режими: таҳлил ҳали ёқилмаган.")
+            return
+        if m.get('chat',{}).get('id') != self.chat:
+            return
         if cmd == '/start':
             self.send('Бот ишлаяпти. /tahlil — расм ёки видеога жавоб қилиб юборинг. /status — 7 кунлик статус (эгаси). /id — ID. Янги текстлар журналга қайд қилинади. Ҳозирги автоматик таҳлил: ' + str(self.auto), m['message_id'])
         elif cmd == '/id':
