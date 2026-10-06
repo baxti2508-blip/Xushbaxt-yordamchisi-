@@ -48,7 +48,8 @@ class Bot:
         self.owner = int(os.getenv('OWNER_TELEGRAM_USER_ID') or '0')
         self.model = os.environ['OPENAI_MODEL']
         self.max_calls = int(os.getenv('MAX_DAILY_CALLS', '10'))
-        self.auto = os.getenv('AUTO_ANALYZE', 'false').lower() == 'true'
+        # The owner requested automatic monitoring of the configured group.
+        self.auto = True
         root = Path(os.getenv('DATA_DIR', '/data'))
         root.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(root / 'bot.sqlite')
