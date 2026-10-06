@@ -11,6 +11,28 @@ from zoneinfo import ZoneInfo
 from bot import Bot, LimitReached, ServiceError, command, response_text, split_text
 
 class Tests(unittest.TestCase):
+    def test_startup_checks_permissions_once_without_paid_ai(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                with patch.object(bot, 'tg', side_effect=[{'id':10,'username':'TestBot'}, {'status':'member'}]), \
+                     patch.object(bot, 'send') as send, patch.object(bot, 'ai') as ai:
+                    bot.startup_check()
+                    self.assertIn('Privacy Mode', send.call_args.args[0])
+                    self.assertIn('@TestBot', send.call_args.args[0])
+                    bot.startup_check()
+                    send.assert_called_once()
+                    ai.assert_not_called()
+                bot.db.close()
+                bot = Bot()
+                with patch.object(bot, 'tg') as tg:
+                    bot.startup_check()
+                    tg.assert_not_called()
+                bot.db.close()
+
     def test_telegram_external_video_reply_is_analyzed(self):
         with tempfile.TemporaryDirectory() as d:
             env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
