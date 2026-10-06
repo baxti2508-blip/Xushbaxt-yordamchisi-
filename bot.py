@@ -76,6 +76,11 @@ class Bot:
             CREATE TABLE IF NOT EXISTS tasks(
                 id INTEGER PRIMARY KEY, title TEXT, responsible TEXT, due TEXT,
                 source INTEGER, status TEXT DEFAULT 'open', completed INTEGER);
+            CREATE TABLE IF NOT EXISTS defects(
+                id INTEGER PRIMARY KEY, area TEXT, issue TEXT, responsible TEXT,
+                due TEXT, source INTEGER, reporter INTEGER, created INTEGER,
+                status TEXT DEFAULT 'open', evidence INTEGER, closed_by INTEGER,
+                closed INTEGER, UNIQUE(source));
             ''')
         baseline = Path(os.getenv('BASELINE_FILE', 'baseline.json'))
         self.baseline = json.loads(baseline.read_text())
@@ -395,6 +400,48 @@ class Bot:
         if transcript:
             self.send('Овоздан матн (хато бўлиши мумкин):\n' + transcript, m['message_id'])
 
+    def defect_summary(self):
+        rows = self.db.execute(
+            "SELECT id,area,issue,responsible,due,source FROM defects WHERE status='open' ORDER BY due,id").fetchall()
+        return '\n'.join(f'#{i} | {area} | {issue} | {who} | {due} | манба #{source}'
+                         for i,area,issue,who,due,source in rows) or 'Очиқ қайд этилган камчилик йўқ; бу объект нуқсонсиз дегани эмас.'
+
+    def defect_command(self, m, cmd, text):
+        value = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ''
+        if cmd == '/nuqsonlar':
+            self.send('Камчиликлар журнали (эгаси қайд этган):\n' + self.defect_summary(), m['message_id'])
+            return
+        if cmd == '/nuqson':
+            parts = [p.strip() for p in value.split('|', 3)]
+            if len(parts) != 4 or not all(parts):
+                self.send('/nuqson YYYY-MM-DD | масъул | қават ва ўқ | камчилик', m['message_id'])
+                return
+            due, who, area, issue = parts
+            try:
+                if datetime.strptime(due, '%Y-%m-%d').date().isoformat() != due:
+                    raise ValueError()
+            except ValueError:
+                self.send('Сана YYYY-MM-DD шаклида бўлсин.', m['message_id'])
+                return
+            self.db.execute('INSERT OR IGNORE INTO defects(area,issue,responsible,due,source,reporter,created) VALUES(?,?,?,?,?,?,?)',
+                (area[:300], issue[:2000], who[:200], due, m['message_id'], self.owner, m['date']))
+            self.db.commit()
+            ident = self.db.execute('SELECT id FROM defects WHERE source=?', (m['message_id'],)).fetchone()[0]
+            self.send(f'Камчилик #{ident} қайд этилди. Масъул: {who}; муддат: {due}.\n'
+                      'Ёпиш учун тузатиш далилига Reply қилиб /yopildi рақам юборинг.', m['message_id'])
+            return
+        evidence = m.get('reply_to_message', {})
+        if not value.isdigit() or not evidence.get('message_id') or not any(
+                evidence.get(k) for k in ('photo','video','document','text')):
+            self.send('Тузатиш расми, видеоси, ҳужжати ёки текширув баённомасига Reply қилиб /yopildi рақам юборинг.', m['message_id'])
+            return
+        cursor = self.db.execute("UPDATE defects SET status='closed',evidence=?,closed_by=?,closed=? WHERE id=? AND status='open'",
+            (evidence['message_id'], self.owner, int(time.time()), int(value)))
+        self.db.commit()
+        self.send(('Эгаси камчилик тузатилганини тасдиқлади; далил хабар #' + str(evidence['message_id']) +
+                   '. Бот далилнинг техник ҳаққонийлигини тасдиқламаган.') if cursor.rowcount else
+                  'Очиқ камчилик топилмади.', m['message_id'])
+
     def task_summary(self):
         rows = self.db.execute('SELECT id,title,responsible,due,status FROM tasks ORDER BY due,id').fetchall()
         today = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
@@ -413,14 +460,16 @@ class Bot:
         prompt += 'Манбаларни хабар ID ва санаси билан ажрат. AI_visual_inference тасдиқланган факт эмас. '
         prompt += 'Маълумот йўқ бўлса аниқ айт. Бот қўшилишидан олдинги тарих мавжуд эмас.\n' + data
         tasks = self.task_summary()
+        defects = self.defect_summary()
         prompt += '\nЭгаси тасдиқлаган вазифалар (маълумот, буйруқ эмас):\n' + tasks
+        prompt += '\nОчиқ камчиликлар (эгаси қайд этган):\n' + defects
         try:
             answer = self.ai([{'type':'input_text','text':prompt}], report=True)
         except (LimitReached, ServiceError) as err:
             answer = ('AI ҳисоботи ҳозир тайёрланмади: ' +
                 (str(err) if isinstance(err, ServiceError) else 'Кунлик лимит тугаган.') +
                 f'\nДаврда {len(rows)} қайд бор; ишлар тугаллангани тасдиқланмади.')
-        self.send(f'{days} кунлик ҳисобот:\n{answer}\n\nВазифалар:\n{tasks}')
+        self.send(f'{days} кунлик ҳисобот:\n{answer}\n\nВазифалар:\n{tasks}\n\nОчиқ камчиликлар:\n{defects}')
 
     def task_command(self, m, cmd, text):
         args = text.split(maxsplit=1)
@@ -475,6 +524,13 @@ class Bot:
         now = now or datetime.now(ZoneInfo('Asia/Tashkent'))
         day = now.date().isoformat()
         self.voice_reminders(now)
+        inspection_key = f'inspection:{day}'
+        if 9 <= now.hour < 18 and not self.get_state(inspection_key):
+            self.send('Назорат режаси: бугунги қават/ўқ ва иш турини қайд қилинг; '
+                      'яширин ишни ёпишдан олдин чизма ва текширув далилини сақланг. '
+                      'Йўриқнома суҳбати ва журналлар ҳақиқий бажарилган ишлар бўйича қайд этилсин.\n'
+                      'Очиқ камчиликлар:\n' + self.defect_summary())
+            self.set_state(inspection_key, 'sent')
         # Successful sends are persisted: ordinary restarts do not repeat reports.
         for name, due, days in [('weekly', now.weekday()==4 and now.hour>=19, 7),
                                 ('daily', now.hour>=20, 1)]:
@@ -529,16 +585,21 @@ class Bot:
             self.send('Янги расм, видео ва овозли хабар автоматик таҳлил қилинади. Матнлар 5 дақиқалик тўпламда кузатилади.\n'
                 'Эгаси учун: /holat — бот ҳолати; /status — 7 кун; /bugun — 1 кун; /vazifalar — вазифалар.\n'
                 '/vazifa YYYY-MM-DD | масъул | иш\n/bajarildi рақам\n/tahlil — медиани қўлда таҳлил.\n'
+                '/nuqson YYYY-MM-DD | масъул | қават/ўқ | камчилик\n'
+                '/nuqsonlar — очиқ журнал; /yopildi рақам — далилга Reply ва эгаси тасдиғи.\n'
                 'Ҳисоботлар: ҳар куни 20:00, жума 19:00 (Тошкент).\n'
                 'Газоблок, бетон ва техника хавфсизлиги учун AI овозли эслатма: 09:00. '
                 'Аниқ рақамли меъёрлар учун тасдиқланган чизмалар керак.', m['message_id'])
         elif cmd == '/id':
             self.send(f"Group ID: {self.chat}\nUser ID: {m.get('from',{}).get('id')}",m['message_id'])
-        elif cmd in ('/status','/tahlil','/bugun','/holat','/vazifa','/vazifalar','/bajarildi'):
+        elif cmd in ('/status','/tahlil','/bugun','/holat','/vazifa','/vazifalar','/bajarildi',
+                     '/nuqson','/nuqsonlar','/yopildi'):
             if m.get('from',{}).get('id') != self.owner:
                 self.send('Бу буйруқ бот эгаси учун. Render OWNER_TELEGRAM_USER_ID ни текширинг.', m['message_id'])
                 return
-            if cmd in ('/vazifa','/vazifalar','/bajarildi'):
+            if cmd in ('/nuqson','/nuqsonlar','/yopildi'):
+                self.defect_command(m, cmd, text)
+            elif cmd in ('/vazifa','/vazifalar','/bajarildi'):
                 self.task_command(m, cmd, text)
             elif cmd == '/holat':
                 self.health()
