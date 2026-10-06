@@ -1,5 +1,6 @@
 """Urgench construction bot. Run one instance with a persistent /data volume."""
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -65,6 +66,7 @@ class Bot:
         self.auto = True
         root = Path(os.getenv('DATA_DIR', '/data'))
         root.mkdir(parents=True, exist_ok=True)
+        self.root = root
         self.db = sqlite3.connect(root / 'bot.sqlite')
         self.db.executescript('''CREATE TABLE IF NOT EXISTS events(
             chat INTEGER, message INTEGER, date INTEGER, kind TEXT, text TEXT,
@@ -110,6 +112,89 @@ class Bot:
             if reply:
                 args['reply_parameters'] = {'message_id':reply,'allow_sending_without_reply':True}
             self.tg('sendMessage', **args)
+
+    def voice_text(self, trade):
+        texts = {
+            'gasblock': ('Газоблокчиларга эслатма. Қават, ўқ, девор қалинлиги, блок тури ва елим ёки '
+                'қоришма талабини тасдиқланган чизма билан солиштиринг. Асос текислиги, қатор сатҳи, '
+                'девор тиклиги, чок ва боғланишларни текширинг. Эшик-дераза ўрни, перемичка ва '
+                'каркасга туташишни чизма бўйича текширинг. Каркасни ўзбошимчалик билан кесманг '
+                'ва тешманг. Яшириладиган боғланишларни ёпишдан олдин масъулга кўрсатинг. '
+                'Иш расмига қават, ўқ ва санани ёзинг.'),
+            'concrete': ('Бетончиларга эслатма. Бугунги элемент, қават ва ўқни аниқланг. Қолип, '
+                'таянчлар, арматура, ҳимоя қатлами, закладной ва тешикларни тасдиқланган чизма '
+                'ҳамда масъул муҳандис билан бетонлашдан олдин текширинг. Бетон лойиҳа синфи '
+                'ва етказиб бериш паспортини солиштиринг. Қоришмага ўзбошимчалик билан сув қўшманг. '
+                'Жойлаш, вибрация, ишчи чок ва парваришни тасдиқланган технологик тартиб бўйича '
+                'бажаринг. Намуна, сана ва элементни қайд қилинг. Қолипни ечиш ва юк беришни '
+                'масъул муҳандис белгилаган тартиб бўйича бажаринг.')
+        }
+        return ('Бу сунъий интеллект овозли эслатмаси. Урганч ўн қаватли лойиҳа. ' + texts[trade] +
+                ' Аниқ рақамли меъёрлар тасдиқланган чизмадан олинади; ботда тўлиқ ҳужжатлар ҳали йўқ.')
+
+    def speech(self, text, day):
+        key = 'tts_attempts:' + day
+        n = int(self.get_state(key, '0'))
+        if n >= 2:
+            raise LimitReached()
+        self.set_state(key, n + 1)
+        payload = dict(model='gpt-4o-mini-tts', voice='coral', input=text,
+                       response_format='mp3', instructions='Speak clearly and slowly in Uzbek. Read the supplied text only.')
+        req = urllib.request.Request('https://api.openai.com/v1/audio/speech',
+            data=json.dumps(payload).encode(),
+            headers={'Content-Type':'application/json','Authorization':f'Bearer {self.key}'})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                audio = r.read(10 * 1024 * 1024 + 1)
+            if not audio or len(audio) > 10 * 1024 * 1024:
+                raise ServiceError('Овозли эслатма файли олинмади.')
+            return audio
+        except urllib.error.HTTPError as err:
+            self.api_error(err)
+
+    def send_voice(self, audio, caption):
+        boundary = 'bot-' + uuid.uuid4().hex
+        parts = []
+        for name, value in [('chat_id', str(self.chat)), ('caption', caption)]:
+            parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'
+                          f'\r\n\r\n{value}\r\n').encode())
+        parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="voice"; '
+                      'filename="reminder.mp3"\r\nContent-Type: audio/mpeg\r\n\r\n').encode())
+        parts.extend([audio, f'\r\n--{boundary}--\r\n'.encode()])
+        req = urllib.request.Request(f'https://api.telegram.org/bot{self.token}/sendVoice',
+            data=b''.join(parts), headers={'Content-Type':f'multipart/form-data; boundary={boundary}'})
+        with urllib.request.urlopen(req, timeout=90) as r:
+            result = json.load(r)
+        if not result.get('ok'):
+            raise ServiceError('Telegram овозли эслатмани қабул қилмади.')
+
+    def voice_reminders(self, now):
+        if os.getenv('VOICE_REMINDERS', 'true').lower() == 'false' or not 9 <= now.hour < 18:
+            return
+        day = now.date().isoformat()
+        for trade, label in [('gasblock','Газоблокчилар'), ('concrete','Бетончилар')]:
+            key = f'voice:{trade}:{day}'
+            if self.get_state(key) == 'sent':
+                continue
+            if time.time() < float(self.get_state(key + ':retry', '0')):
+                continue
+            text = self.voice_text(trade)
+            digest = hashlib.sha256(text.encode()).hexdigest()[:24]
+            cache = self.root / f'reminder-{trade}-{digest}.mp3'
+            try:
+                if not cache.exists():
+                    audio = self.speech(text, day)
+                    temporary = cache.with_suffix('.tmp')
+                    temporary.write_bytes(audio)
+                    temporary.replace(cache)
+                self.send_voice(cache.read_bytes(), 'AI овозли эслатма — ' + label + ' — ' + day)
+                self.set_state(key, 'sent')
+            except LimitReached:
+                continue
+            except Exception:
+                self.set_state(key + ':retry', time.time() + 1800)
+                self.set_state('last_error', 'Овозли эслатма юборилмади; қайта уриниш кечиктирилди.')
+                print('Voice reminder failed; retry delayed.', flush=True)
 
     def reserve(self, report=False):
         day = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
@@ -363,10 +448,11 @@ class Bot:
         self.send('Кузатув ёқилган. Ботга етиб келган янги хабарлар қайд қилинади.\n'
             f'Бугун AI сўровлари: {row[0] if row else 0}/{self.max_calls}.\n'
             'Кунлик ҳисобот: 20:00. Ҳафталик: жума 19:00. Тошкент вақти.\n'
+            'Газоблокчилар ва бетончиларга овозли эслатма: ҳар куни 09:00 (Тошкент).\n'
             'Охирги AI натижаси: ' + (datetime.fromtimestamp(int(success), ZoneInfo('Asia/Tashkent')).isoformat()
                 if success else 'Ҳали муваффақиятли таҳлил йўқ.') + '\n'
             f'Қабул қилинган медиа: {media_count}.\n'
-            'Охирги медиа таҳлили: ' + (datetime.fromtimestamp(int(visual), ZoneInfo('Asia/Tashkent')).isoformat()
+            'Охирги расм/видео таҳлили: ' + (datetime.fromtimestamp(int(visual), ZoneInfo('Asia/Tashkent')).isoformat()
                 if visual else 'Ҳали муваффақиятли медиа таҳлили йўқ.') + '\n' + self.get_state('last_error'))
 
     def scheduled(self, now=None):
@@ -374,6 +460,7 @@ class Bot:
             return
         now = now or datetime.now(ZoneInfo('Asia/Tashkent'))
         day = now.date().isoformat()
+        self.voice_reminders(now)
         # Successful sends are persisted: ordinary restarts do not repeat reports.
         for name, due, days in [('weekly', now.weekday()==4 and now.hour>=19, 7),
                                 ('daily', now.hour>=20, 1)]:
@@ -428,7 +515,9 @@ class Bot:
             self.send('Янги расм, видео ва овозли хабар автоматик таҳлил қилинади. Матнлар 5 дақиқалик тўпламда кузатилади.\n'
                 'Эгаси учун: /holat — бот ҳолати; /status — 7 кун; /bugun — 1 кун; /vazifalar — вазифалар.\n'
                 '/vazifa YYYY-MM-DD | масъул | иш\n/bajarildi рақам\n/tahlil — медиани қўлда таҳлил.\n'
-                'Ҳисоботлар: ҳар куни 20:00, жума 19:00 (Тошкент).', m['message_id'])
+                'Ҳисоботлар: ҳар куни 20:00, жума 19:00 (Тошкент).\n'
+                'Газоблокчилар ва бетончиларга AI овозли текширув эслатмаси: 09:00. '
+                'Аниқ рақамли меъёрлар учун тасдиқланган чизмалар керак.', m['message_id'])
         elif cmd == '/id':
             self.send(f"Group ID: {self.chat}\nUser ID: {m.get('from',{}).get('id')}",m['message_id'])
         elif cmd in ('/status','/tahlil','/bugun','/holat','/vazifa','/vazifalar','/bajarildi'):
