@@ -7,6 +7,28 @@ from unittest.mock import patch
 from bot import Bot, LimitReached, command, response_text, split_text
 
 class Tests(unittest.TestCase):
+    def test_setup_only_discloses_current_ids(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='', OWNER_TELEGRAM_USER_ID='',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                with patch.object(bot, 'tg') as tg, patch.object(bot, 'ai') as ai:
+                    msg = dict(chat={'id':-100123}, **{'from':{'id':42}},
+                               text='/id', message_id=1, date=1)
+                    bot.handle(msg)
+                    self.assertEqual(tg.call_args.kwargs['chat_id'], -100123)
+                    self.assertIn('User ID: 42', tg.call_args.kwargs['text'])
+                    for text in ('private text', '/status', '/tahlil'):
+                        bot.handle({**msg, 'text':text})
+                    ai.assert_not_called()
+                    self.assertEqual(tg.call_count, 1)
+                    self.assertEqual(bot.chat, 0)
+                    self.assertEqual(bot.owner, 0)
+                    self.assertEqual(bot.db.execute('SELECT count(*) FROM events').fetchone()[0],0)
+                bot.db.close()
+
     def test_response(self):
         self.assertEqual(response_text({'output':[{'content':[{'type':'output_text','text':'ok'}]}]}),'ok')
         self.assertEqual(command('/status@Urgench10QavatNazorat_bot'),'/status')
