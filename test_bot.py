@@ -11,6 +11,39 @@ from zoneinfo import ZoneInfo
 from bot import Bot, LimitReached, ServiceError, command, response_text, split_text
 
 class Tests(unittest.TestCase):
+    def test_failed_automatic_media_survives_restart_and_retries_without_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                msg = dict(chat={'id':-100123}, **{'from':{'id':2}},
+                           message_id=123, date=bot.started, video={'file_id':'fake'})
+                with patch.object(bot, 'analyze', side_effect=ServiceError('temporary')):
+                    with self.assertRaises(ServiceError):
+                        bot.handle(msg)
+                bot.db.close()
+                bot = Bot()
+                bot.db.execute('UPDATE media_queue SET retry_at=0')
+                bot.db.commit()
+                with patch.object(bot, 'analyze') as analyze:
+                    bot.retry_media()
+                    analyze.assert_called_once_with(msg)
+                bot.db.execute('UPDATE media_queue SET retry_at=0')
+                bot.db.commit()
+                with patch.object(bot, 'analyze', side_effect=LimitReached):
+                    bot.retry_media()
+                self.assertEqual(bot.db.execute('SELECT attempts FROM media_queue').fetchone()[0], 2)
+                bot.db.execute('UPDATE media_queue SET retry_at=0')
+                bot.db.commit()
+                with patch.object(bot, 'analyze', side_effect=ServiceError('temporary')):
+                    bot.retry_media()
+                with patch.object(bot, 'analyze') as analyze:
+                    bot.retry_media()
+                    analyze.assert_not_called()
+                bot.db.close()
+
     def test_health_distinguishes_group_privacy_from_analysis_failure(self):
         with tempfile.TemporaryDirectory() as d:
             env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
