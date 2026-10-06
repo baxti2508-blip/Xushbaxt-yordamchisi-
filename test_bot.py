@@ -11,6 +11,27 @@ from zoneinfo import ZoneInfo
 from bot import Bot, LimitReached, ServiceError, command, response_text, split_text
 
 class Tests(unittest.TestCase):
+    def test_health_distinguishes_group_privacy_from_analysis_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                bot.set_state('last_media_error', 'Медиа таҳлили: файл катта.')
+                for admin, privacy_off, expected in [
+                        (False,False,'Privacy Mode ёқилган'),
+                        (True,False,'оддий гуруҳ хабарларини олиши мумкин'),
+                        (False,True,'оддий гуруҳ хабарларини олиши мумкин')]:
+                    with patch.object(bot, 'tg', side_effect=[
+                            {'id':10,'can_read_all_group_messages':privacy_off},
+                            {'status':'administrator' if admin else 'member'}]), \
+                         patch.object(bot, 'send') as send:
+                        bot.health()
+                        self.assertIn(expected, send.call_args.args[0])
+                        self.assertIn('файл катта', send.call_args.args[0])
+                bot.db.close()
+
     def test_dialogue_bypasses_media_limit_and_counts_attempts(self):
         with tempfile.TemporaryDirectory() as d:
             env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
