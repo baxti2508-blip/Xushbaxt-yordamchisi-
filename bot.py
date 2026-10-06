@@ -174,7 +174,7 @@ class Bot:
         if m.get('from',{}).get('is_bot'):
             return
         text = m.get('text', '')
-        cmd = command(text)
+        cmd = command(text or m.get('caption', ''))
         # Before configuration, disclose only this message's IDs. Never save
         # content, adopt an owner/group, or call AI until BOTH IDs are set.
         if not self.chat or not self.owner:
@@ -202,6 +202,8 @@ class Bot:
                 return
             if cmd == '/status':
                 self.status()
+            elif m.get('photo') or m.get('video') or m.get('document'):
+                self.analyze(m)
             elif m.get('reply_to_message'):
                 self.analyze(m['reply_to_message'])
             else:
