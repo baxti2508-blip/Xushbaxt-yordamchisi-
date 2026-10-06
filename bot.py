@@ -89,6 +89,9 @@ class Bot:
                 question TEXT, answer_message INTEGER, answered_by INTEGER);
             CREATE TABLE IF NOT EXISTS dialogue(
                 message INTEGER PRIMARY KEY, source INTEGER, role TEXT, text TEXT);
+            CREATE TABLE IF NOT EXISTS media_queue(
+                message INTEGER PRIMARY KEY, payload TEXT, retry_at INTEGER,
+                attempts INTEGER DEFAULT 1);
             ''')
         baseline = Path(os.getenv('BASELINE_FILE', 'baseline.json'))
         self.baseline = json.loads(baseline.read_text())
@@ -445,6 +448,7 @@ class Bot:
         self.set_state('last_visual_success', int(time.time()))
         self.set_state('last_media', f'Манба #{m["message_id"]}; таҳлил муваффақиятли.')
         self.record(m, 'AI_visual_inference', answer)
+        self.db.execute('DELETE FROM media_queue WHERE message=?', (m['message_id'],))
         self.db.execute('INSERT OR IGNORE INTO inspections(source,date,area_report,analysis) VALUES(?,?,?,?)',
             (m['message_id'], m['date'], m.get('caption','')[:1000], answer[:12000]))
         self.db.commit()
@@ -712,6 +716,35 @@ class Bot:
             self.send('Хабарлар бўйича кузатув (баёнотлар ҳали текширилмаган):\n' + answer)
             self.set_state('text_cursor', rows[-1][0])
 
+    def retry_media(self):
+        row = self.db.execute('SELECT message,payload,attempts FROM media_queue '
+                              'WHERE retry_at<=? AND attempts<3 ORDER BY retry_at LIMIT 1',
+                              (int(time.time()),)).fetchone()
+        if not row:
+            return
+        source, payload, attempts = row
+        if self.db.execute("SELECT 1 FROM events WHERE message=? AND kind='AI_visual_inference'", (source,)).fetchone():
+            self.db.execute('DELETE FROM media_queue WHERE message=?', (source,))
+            self.db.commit()
+            return
+        self.db.execute('UPDATE media_queue SET attempts=?,retry_at=? WHERE message=?',
+                        (attempts+1, int(time.time())+1800, source))
+        self.db.commit()
+        try:
+            self.analyze(json.loads(payload))
+        except LimitReached:
+            # A quota wait is not a failed media attempt. Resume tomorrow.
+            self.db.execute('UPDATE media_queue SET attempts=?,retry_at=? WHERE message=?',
+                            (attempts, int(time.time())+86400, source))
+            self.db.commit()
+        except ValueError as err:
+            self.db.execute('DELETE FROM media_queue WHERE message=?', (source,))
+            self.db.commit()
+            self.set_state('last_media_error', str(err)[:500])
+            self.send(str(err), source)
+        except Exception:
+            self.set_state('last_media_error', f'Манба #{source}: автоматик қайта уриниш муваффақиятсиз ({attempts+1}/3).')
+
     def handle(self, m):
         if m.get('from',{}).get('is_bot'):
             return
@@ -776,6 +809,9 @@ class Bot:
                 self.record(m, 'media_received', 'Медиа қабул қилинди; қабул қилиш иш тугалланганини тасдиқламайди.')
                 self.set_state('last_media', f'Манба #{m["message_id"]}; медиа қабул қилинди.')
                 if self.auto and m['date'] >= self.monitor_since:
+                    self.db.execute('INSERT OR IGNORE INTO media_queue(message,payload,retry_at) VALUES(?,?,?)',
+                                    (m['message_id'], json.dumps(m, ensure_ascii=False), int(time.time())+300))
+                    self.db.commit()
                     self.analyze(m)
                 else:
                     self.set_state('last_media', f'Манба #{m["message_id"]}; бот кузатувидан олдинги хабар, автоматик ўтказиб юборилди.')
@@ -814,6 +850,7 @@ class Bot:
                     self.db.execute("INSERT OR REPLACE INTO state VALUES('offset',?)",(str(update['update_id']+1),))
                     self.db.commit()
                 try:
+                    self.retry_media()
                     self.scheduled()
                 except LimitReached:
                     pass  # Text remains queued; avoid repeated limit messages.
