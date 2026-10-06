@@ -25,8 +25,12 @@ class Tests(unittest.TestCase):
                     speech.assert_not_called()
                     bot.voice_reminders(now)
                     bot.voice_reminders(now)
-                    self.assertEqual(speech.call_count, 2)
-                    self.assertEqual(send.call_count, 2)
+                    self.assertEqual(speech.call_count, 3)
+                    self.assertEqual(send.call_count, 3)
+                    safety = bot.voice_text('safety')
+                    self.assertIn('йўриқнома суҳбатини', safety)
+                    self.assertIn('журналларига ҳақиқий сана', safety)
+                    self.assertIn('Ўтказилмаган суҳбатни', safety)
                 bot.db.close()
                 bot = Bot()
                 with patch.object(bot, 'speech') as speech, patch.object(bot, 'send_voice') as send:
@@ -35,15 +39,15 @@ class Tests(unittest.TestCase):
                     send.side_effect = RuntimeError('network')
                     tomorrow = now.replace(day=8)
                     bot.voice_reminders(tomorrow)
-                    self.assertEqual(send.call_count, 2)
+                    self.assertEqual(send.call_count, 3)
                     bot.voice_reminders(tomorrow)
-                    self.assertEqual(send.call_count, 2)
+                    self.assertEqual(send.call_count, 3)
                     speech.assert_not_called()
                     send.side_effect = None
-                    for trade in ('gasblock', 'concrete'):
+                    for trade in ('gasblock', 'concrete', 'safety'):
                         bot.set_state(f'voice:{trade}:2026-10-08:retry', 0)
                     bot.voice_reminders(tomorrow)
-                    self.assertEqual(send.call_count, 4)
+                    self.assertEqual(send.call_count, 6)
                     speech.assert_not_called()
                 bot.db.close()
 
@@ -56,13 +60,14 @@ class Tests(unittest.TestCase):
                 bot = Bot()
                 with patch('urllib.request.urlopen') as urlopen:
                     urlopen.return_value.__enter__.side_effect = [
-                        io.BytesIO(b'mp3'), io.BytesIO(b'mp3'),
+                        io.BytesIO(b'mp3'), io.BytesIO(b'mp3'), io.BytesIO(b'mp3'),
                         io.BytesIO(b'{"ok":true,"result":{}}')]
                     self.assertEqual(bot.speech('Эслатма', '2026-10-07'), b'mp3')
                     payload = json.loads(urlopen.call_args.args[0].data)
                     self.assertEqual(payload['model'], 'gpt-4o-mini-tts')
                     self.assertEqual(payload['response_format'], 'mp3')
                     self.assertEqual(payload['input'], 'Эслатма')
+                    bot.speech('Эслатма', '2026-10-07')
                     bot.speech('Эслатма', '2026-10-07')
                     with self.assertRaises(LimitReached):
                         bot.speech('Эслатма', '2026-10-07')
