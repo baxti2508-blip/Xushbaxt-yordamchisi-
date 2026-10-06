@@ -137,12 +137,37 @@ class Tests(unittest.TestCase):
                     self.assertTrue(any('Овоздан матн' in x.args[0] for x in send.call_args_list))
                     bot.handle(msg)
                     self.assertEqual(transcribe.call_count, 1)
+                    self.assertEqual(bot.db.execute('SELECT count(*) FROM inspections').fetchone()[0], 1)
+                    self.assertIsNone(bot.db.execute('SELECT reviewed FROM inspections').fetchone()[0])
                     video = {k:v for k,v in msg.items() if k!='voice'}
                     video.update(message_id=61, video={'file_id':'fake'})
                     bot.handle(video)
                     images.assert_called_once_with(video, raw=b'media')
                     self.assertTrue(any(x['type']=='input_image' for x in ai.call_args.args[0]))
                     self.assertIn('Қолип тугамади', str(ai.call_args))
+                bot.db.close()
+
+    def test_inspection_review_requires_owner_and_does_not_accept_work(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                bot.db.execute('INSERT INTO inspections(source,date,area_report,analysis) VALUES(60,?,?,?)',
+                               (bot.started,'6-қават','AI тахмини'))
+                bot.db.commit()
+                msg = dict(chat={'id':-100123}, **{'from':{'id':2}},
+                           message_id=95, date=bot.started, text='/tekshirildi 60')
+                with patch.object(bot, 'send') as send:
+                    bot.handle(msg)
+                    self.assertIsNone(bot.db.execute('SELECT reviewed FROM inspections').fetchone()[0])
+                    msg['from']['id'] = 1
+                    bot.handle(msg)
+                    self.assertEqual(bot.db.execute('SELECT reviewed_by FROM inspections').fetchone()[0], 1)
+                    msg.update(message_id=96, text='/nazorat')
+                    bot.handle(msg)
+                    self.assertIn('иш қабул қилингани эмас', send.call_args.args[0])
                 bot.db.close()
 
     def test_transcription_multipart_and_reserved_analysis_slot(self):
