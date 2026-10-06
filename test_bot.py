@@ -11,6 +11,27 @@ from zoneinfo import ZoneInfo
 from bot import Bot, LimitReached, ServiceError, command, response_text, split_text
 
 class Tests(unittest.TestCase):
+    def test_telegram_external_video_reply_is_analyzed(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                msg = dict(chat={'id':-100123}, **{'from':{'id':1}},
+                           message_id=124, date=bot.started, text='/tahlil',
+                           external_reply={'origin':{'date':bot.started-60},
+                                           'chat':{'id':-100999}, 'message_id':7,
+                                           'video':{'file_id':'fake'}})
+                with patch.object(bot, 'analyze') as analyze:
+                    bot.handle(msg)
+                    target = analyze.call_args.args[0]
+                    self.assertEqual(target['video']['file_id'], 'fake')
+                    self.assertEqual(target['message_id'], 124)
+                    self.assertEqual(target['chat']['id'], -100123)
+                    self.assertEqual(target['date'], bot.started-60)
+                bot.db.close()
+
     def test_failed_automatic_media_survives_restart_and_retries_without_command(self):
         with tempfile.TemporaryDirectory() as d:
             env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
