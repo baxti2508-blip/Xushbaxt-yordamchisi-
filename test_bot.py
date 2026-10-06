@@ -11,6 +11,34 @@ from zoneinfo import ZoneInfo
 from bot import Bot, LimitReached, ServiceError, command, response_text, split_text
 
 class Tests(unittest.TestCase):
+    def test_questions_dedup_limit_and_worker_reply_link(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                msg = dict(chat={'id':-100123}, **{'from':{'id':2}},
+                           message_id=100, date=bot.started, caption='6-қават')
+                with patch.object(bot, 'send', return_value=200) as send:
+                    bot.ask_question(msg, 'SAVOL: Бетон паспорти борми?')
+                    bot.ask_question(msg, 'SAVOL: Бетон паспорти борми?')
+                    self.assertEqual(send.call_count, 1)
+                    bot.ask_question(dict(msg, message_id=101), 'SAVOL: YOQ')
+                    self.assertEqual(send.call_count, 1)
+                    for ident in (101,102,103):
+                        bot.ask_question(dict(msg, message_id=ident), 'SAVOL: Иш санаси қайси?')
+                    self.assertEqual(send.call_count, 3)
+                    reply = dict(msg, message_id=104, text='Паспорт эртага келади',
+                                 reply_to_message={'message_id':200})
+                    bot.handle(reply)
+                self.assertEqual(bot.db.execute('SELECT answer_message,answered_by FROM questions WHERE source=100').fetchone(),
+                                 (104,2))
+                saved = bot.db.execute("SELECT text FROM events WHERE kind='clarification_unverified'").fetchone()[0]
+                self.assertIn('Манба #100', saved)
+                self.assertIn('Паспорт эртага келади', saved)
+                bot.db.close()
+
     def test_defect_owner_evidence_dedup_and_restart(self):
         with tempfile.TemporaryDirectory() as d:
             env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
