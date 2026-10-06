@@ -7,7 +7,7 @@ Imkoniyatlar
 - Egasi rasmlarga/video xabarlariga Reply qilib /tahlil yuborishi mumkin.
 - Video: 19 MB va 3 daqiqagacha, 6 ta teng taqsimlangan kadr. Audio tekshirilmaydi.
 - Egasi /status orqali oxirgi 7 kun qaydlaridan status oladi.
-- AUTO_ANALYZE=true bo'lsa yangi media avtomatik tahlil qilinadi.
+- Belgilangan guruhdagi yangi media avtomatik tahlil qilinadi; AUTO_ANALYZE eski sozlamasi ishlatilmaydi. Kunlik so'rov limiti saqlanadi.
 - Har kuni Toshkent sanasi bo'yicha maksimum 10 AI urinish (o'zgartirish mumkin).
 Bu pul bo'yicha qat'iy limit emas: tokenlar va model narxi xarajatni belgilaydi.
 - Faqat TELEGRAM_CHAT_ID bilan ko'rsatilgan bitta guruhni kuzatadi.
