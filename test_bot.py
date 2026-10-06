@@ -29,6 +29,30 @@ class Tests(unittest.TestCase):
                     self.assertEqual(bot.db.execute('SELECT count(*) FROM events').fetchone()[0],0)
                 bot.db.close()
 
+    def test_caption_and_reply_analysis(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                msg = dict(chat={'id':-100123}, **{'from':{'id':1}},
+                           message_id=10, date=1, video={'file_id':'fake'},
+                           caption='/tahlil@Urgench10QavatNazorat_bot')
+                with patch.object(bot, 'analyze') as analyze, patch.object(bot, 'send') as send:
+                    bot.handle(msg)
+                    analyze.assert_called_once_with(msg)
+                    analyze.reset_mock()
+                    reply = {k:v for k,v in msg.items() if k not in ('video', 'caption')}
+                    reply.update(text='/tahlil', reply_to_message=msg)
+                    bot.handle(reply)
+                    analyze.assert_called_once_with(msg)
+                    analyze.reset_mock()
+                    bot.handle({**msg, 'from':{'id':2}})
+                    analyze.assert_not_called()
+                    self.assertIn('OWNER_TELEGRAM_USER_ID', send.call_args.args[0])
+                bot.db.close()
+
     def test_response(self):
         self.assertEqual(response_text({'output':[{'content':[{'type':'output_text','text':'ok'}]}]}),'ok')
         self.assertEqual(command('/status@Urgench10QavatNazorat_bot'),'/status')
@@ -50,7 +74,14 @@ class Tests(unittest.TestCase):
                 bot.handle({'chat':{'id':5},'text':'private'})
                 bot.handle({'chat':{'id':-100123},'from':{'is_bot':True},'text':'bot'})
                 self.assertEqual(bot.db.execute('SELECT count(*) FROM events').fetchone()[0],0)
-                bot.handle({'chat':{'id':-100123},'from':{'id':2},'text':'/status','message_id':2,'date':1})
+                with patch.object(bot, 'tg') as tg, patch.object(bot, 'ai') as ai:
+                    bot.handle({'chat':{'id':-100123},'from':{'id':2},'text':'/status','message_id':2,'date':1})
+                    self.assertIn('OWNER_TELEGRAM_USER_ID', tg.call_args.kwargs['text'])
+                    bot.handle({'chat':{'id':5},'from':{'id':1},'text':'/id','message_id':3,'date':1})
+                    self.assertEqual(tg.call_args.kwargs['chat_id'], 5)
+                    self.assertIn('TELEGRAM_CHAT_ID', tg.call_args.kwargs['text'])
+                    ai.assert_not_called()
+                    self.assertEqual(bot.db.execute('SELECT count(*) FROM events').fetchone()[0],0)
                 self.assertEqual(p.read_bytes(),before)
                 bot.db.close()
 
