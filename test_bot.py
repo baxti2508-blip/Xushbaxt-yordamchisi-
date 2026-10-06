@@ -11,6 +11,71 @@ from zoneinfo import ZoneInfo
 from bot import Bot, LimitReached, ServiceError, command, response_text, split_text
 
 class Tests(unittest.TestCase):
+    def test_voice_reminders_daily_restart_cache_and_retry(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d, VOICE_REMINDERS='true')
+            now = datetime(2026, 10, 7, 9, tzinfo=ZoneInfo('Asia/Tashkent'))
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                with patch.object(bot, 'speech', return_value=b'mp3') as speech, \
+                     patch.object(bot, 'send_voice') as send:
+                    bot.voice_reminders(now.replace(hour=8))
+                    speech.assert_not_called()
+                    bot.voice_reminders(now)
+                    bot.voice_reminders(now)
+                    self.assertEqual(speech.call_count, 2)
+                    self.assertEqual(send.call_count, 2)
+                bot.db.close()
+                bot = Bot()
+                with patch.object(bot, 'speech') as speech, patch.object(bot, 'send_voice') as send:
+                    bot.voice_reminders(now)
+                    send.assert_not_called()
+                    send.side_effect = RuntimeError('network')
+                    tomorrow = now.replace(day=8)
+                    bot.voice_reminders(tomorrow)
+                    self.assertEqual(send.call_count, 2)
+                    bot.voice_reminders(tomorrow)
+                    self.assertEqual(send.call_count, 2)
+                    speech.assert_not_called()
+                    send.side_effect = None
+                    for trade in ('gasblock', 'concrete'):
+                        bot.set_state(f'voice:{trade}:2026-10-08:retry', 0)
+                    bot.voice_reminders(tomorrow)
+                    self.assertEqual(send.call_count, 4)
+                    speech.assert_not_called()
+                bot.db.close()
+
+    def test_tts_payload_cap_and_telegram_voice_upload(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                with patch('urllib.request.urlopen') as urlopen:
+                    urlopen.return_value.__enter__.side_effect = [
+                        io.BytesIO(b'mp3'), io.BytesIO(b'mp3'),
+                        io.BytesIO(b'{"ok":true,"result":{}}')]
+                    self.assertEqual(bot.speech('Эслатма', '2026-10-07'), b'mp3')
+                    payload = json.loads(urlopen.call_args.args[0].data)
+                    self.assertEqual(payload['model'], 'gpt-4o-mini-tts')
+                    self.assertEqual(payload['response_format'], 'mp3')
+                    self.assertEqual(payload['input'], 'Эслатма')
+                    bot.speech('Эслатма', '2026-10-07')
+                    with self.assertRaises(LimitReached):
+                        bot.speech('Эслатма', '2026-10-07')
+                    bot.send_voice(b'\x00mp3-binary', 'AI овоз')
+                    req = urlopen.call_args.args[0]
+                    self.assertTrue(req.full_url.endswith('/sendVoice'))
+                    self.assertIn(b'filename="reminder.mp3"', req.data)
+                    self.assertIn(b'\x00mp3-binary', req.data)
+                    self.assertIn(b'-100123', req.data)
+                    self.assertNotIn(b'fake', req.data)
+                    self.assertEqual(bot.db.execute('SELECT count(*) FROM calls').fetchone()[0], 0)
+                bot.db.close()
+
     def test_audio_and_video_are_combined_with_transcript(self):
         with tempfile.TemporaryDirectory() as d:
             env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
