@@ -11,7 +11,23 @@ from zoneinfo import ZoneInfo
 from bot import Bot, LimitReached, ServiceError, command, response_text, split_text
 
 class Tests(unittest.TestCase):
-    def test_questions_dedup_limit_and_worker_reply_link(self):
+    def test_dialogue_bypasses_media_limit_and_counts_attempts(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d, MAX_DAILY_CALLS='3')
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                response = {'output':[{'content':[{'type':'output_text','text':'Жавоб'}]}]}
+                with patch.object(bot, 'request', return_value=response), patch.object(bot, 'reserve') as reserve:
+                    for _ in range(12):
+                        self.assertEqual(bot.ai([{'type':'input_text','text':'Савол'}], dialogue=True), 'Жавоб')
+                    reserve.assert_not_called()
+                day = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
+                self.assertEqual(bot.get_state('dialogue_attempts:' + day), '12')
+                bot.db.close()
+
+    def test_questions_dedup_no_daily_limit_and_worker_reply_link(self):
         with tempfile.TemporaryDirectory() as d:
             env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
                        TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
@@ -20,7 +36,8 @@ class Tests(unittest.TestCase):
                 bot = Bot()
                 msg = dict(chat={'id':-100123}, **{'from':{'id':2}},
                            message_id=100, date=bot.started, caption='6-қават')
-                with patch.object(bot, 'send', return_value=200) as send:
+                with patch.object(bot, 'send', return_value=200) as send, \
+                     patch.object(bot, 'ai', return_value='Паспорт келганда юборинг.') as ai:
                     bot.ask_question(msg, 'SAVOL: Бетон паспорти борми?')
                     bot.ask_question(msg, 'SAVOL: Бетон паспорти борми?')
                     self.assertEqual(send.call_count, 1)
@@ -28,10 +45,11 @@ class Tests(unittest.TestCase):
                     self.assertEqual(send.call_count, 1)
                     for ident in (101,102,103):
                         bot.ask_question(dict(msg, message_id=ident), 'SAVOL: Иш санаси қайси?')
-                    self.assertEqual(send.call_count, 3)
+                    self.assertEqual(send.call_count, 4)
                     reply = dict(msg, message_id=104, text='Паспорт эртага келади',
                                  reply_to_message={'message_id':200})
                     bot.handle(reply)
+                    self.assertTrue(ai.call_args.kwargs['dialogue'])
                 self.assertEqual(bot.db.execute('SELECT answer_message,answered_by FROM questions WHERE source=100').fetchone(),
                                  (104,2))
                 saved = bot.db.execute("SELECT text FROM events WHERE kind='clarification_unverified'").fetchone()[0]
