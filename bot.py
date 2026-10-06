@@ -798,8 +798,20 @@ class Bot:
                 self.analyze(m)
             elif m.get('reply_to_message'):
                 self.analyze(m['reply_to_message'])
+            elif any(m.get('external_reply', {}).get(k) for k in ('photo','video','document','voice','audio')):
+                # Telegram can represent a visible Reply as ExternalReplyInfo.
+                # Attribute the result to this group's command, not a foreign
+                # message ID (IDs are only unique within their original chat).
+                external = m['external_reply']
+                media = {k: external[k] for k in ('photo','video','document','voice','audio') if external.get(k)}
+                target = dict(media, chat=m['chat'], message_id=m['message_id'],
+                              date=external.get('origin', {}).get('date', m['date']))
+                target['caption'] = 'Reply орқали берилган медиа; асл хабар гуруҳ/сана маълумотлари алоҳида текширилади.'
+                self.analyze(target)
             else:
-                self.send('Расм, видео ёки овозли хабарга Reply қилиб /tahlil юборинг.', m['message_id'])
+                self.set_state('last_media_error', 'Telegram буйруқ билан медиа ёки Reply файл маълумотини бермади.')
+                self.send('Telegram бу буйруқ билан видео файл маълумотини ботга етказмади. '
+                          'Таҳлил бошланмади; бу сизнинг Reply қилишингиз нотўғри дегани эмас.', m['message_id'])
         else:
             self.record_answer(m)
             note = text or m.get('caption', '')
