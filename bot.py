@@ -386,6 +386,8 @@ class Bot:
         if self.db.execute("SELECT 1 FROM events WHERE message=? AND kind='AI_visual_inference'", (m['message_id'],)).fetchone():
             return
         self.send('Медиа қабул қилинди. Кадрлар ва мавжуд овоз таҳлили бошланди.', m['message_id'])
+        self.set_state('last_media', f'Манба #{m["message_id"]}; таҳлил бошланди.')
+        self.set_state('last_media_error', '')
         content = [{'type':'input_text','text':json.dumps({
             'source_message':m['message_id'], 'date_utc':datetime.fromtimestamp(m['date'], timezone.utc).isoformat(),
             'caption':m.get('caption',''), 'task':'Медиа кадрлари ва овозда айтилган гапларни алоҳида таҳлил қил. Фақат овоз бўлса кўринган факт ўйлаб топма.'},ensure_ascii=False)}]
@@ -441,6 +443,7 @@ class Bot:
                 {'type':'input_image','image_url':'data:image/jpeg;base64,' + base64.b64encode(raw).decode(),'detail':'high'}])
         answer = self.ai(content)
         self.set_state('last_visual_success', int(time.time()))
+        self.set_state('last_media', f'Манба #{m["message_id"]}; таҳлил муваффақиятли.')
         self.record(m, 'AI_visual_inference', answer)
         self.db.execute('INSERT OR IGNORE INTO inspections(source,date,area_report,analysis) VALUES(?,?,?,?)',
             (m['message_id'], m['date'], m.get('caption','')[:1000], answer[:12000]))
@@ -639,6 +642,17 @@ class Bot:
             self.send(self.task_summary(), m['message_id'])
 
     def health(self):
+        access = 'Гуруҳ медиасини ўқиш рухсатини текшириб бўлмади.'
+        try:
+            me = self.tg('getMe')
+            member = self.tg('getChatMember', chat_id=self.chat, user_id=me['id'])
+            if member.get('status') in ('administrator', 'creator') or me.get('can_read_all_group_messages'):
+                access = 'Telegram: бот оддий гуруҳ хабарларини олиши мумкин.'
+            else:
+                access = ('Telegram: Privacy Mode ёқилган. Автоматик медиа олиш учун '
+                          'ботни гуруҳ администратори қилинг ёки BotFather /setprivacy орқали ўчиринг.')
+        except Exception:
+            pass
         day = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
         row = self.db.execute('SELECT n FROM calls WHERE day=?', (day,)).fetchone()
         success = self.get_state('last_ai_success')
@@ -652,6 +666,8 @@ class Bot:
             'Охирги AI натижаси: ' + (datetime.fromtimestamp(int(success), ZoneInfo('Asia/Tashkent')).isoformat()
                 if success else 'Ҳали муваффақиятли таҳлил йўқ.') + '\n'
             f'Қабул қилинган медиа: {media_count}.\n'
+            + access + '\n' + self.get_state('last_media', 'Охирги медиа қайди йўқ.') + '\n' +
+            self.get_state('last_media_error') + '\n' +
             'Охирги расм/видео таҳлили: ' + (datetime.fromtimestamp(int(visual), ZoneInfo('Asia/Tashkent')).isoformat()
                 if visual else 'Ҳали муваффақиятли медиа таҳлили йўқ.') + '\n' + self.get_state('last_error'))
 
@@ -758,8 +774,11 @@ class Bot:
                 self.record(m, 'user_report_unverified', note)
             if m.get('photo') or m.get('video') or m.get('document') or m.get('voice') or m.get('audio'):
                 self.record(m, 'media_received', 'Медиа қабул қилинди; қабул қилиш иш тугалланганини тасдиқламайди.')
+                self.set_state('last_media', f'Манба #{m["message_id"]}; медиа қабул қилинди.')
                 if self.auto and m['date'] >= self.monitor_since:
                     self.analyze(m)
+                else:
+                    self.set_state('last_media', f'Манба #{m["message_id"]}; бот кузатувидан олдинги хабар, автоматик ўтказиб юборилди.')
 
     def run(self):
         print(f'Bot starting: chat={self.chat}, owner={self.owner}, model={self.model}, auto={self.auto}', flush=True)
@@ -776,10 +795,16 @@ class Bot:
                         if m:
                             self.handle(m)
                     except LimitReached:
+                        if m and any(m.get(k) for k in ('photo','video','document','voice','audio')):
+                            self.set_state('last_media_error', 'Медиа таҳлили: кунлик AI лимити тугаган.')
                         self.send('Кунлик AI сўровлари лимити тугади. Эртага давом этамиз.')
                     except (ValueError, ServiceError) as err:
+                        if m and any(m.get(k) for k in ('photo','video','document','voice','audio')):
+                            self.set_state('last_media_error', 'Медиа таҳлили: ' + str(err)[:500])
                         self.send(str(err))
                     except Exception:
+                        if m and any(m.get(k) for k in ('photo','video','document','voice','audio')):
+                            self.set_state('last_media_error', 'Медиа таҳлили тугамади: файлни юклаш, кадр/овоз олиш ёки API босқичида хато.')
                         # Never print URLs, request headers or credentials.
                         print('Update failed; check credentials, credits, model access and media.', flush=True)
                         try:
