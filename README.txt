@@ -1,5 +1,5 @@
 URGENCH QURILISH BOTI — O'RNATISH PAKETI
-Holat: tayyor prototip; haqiqiy Telegram/OpenAI bilan sinov va hosting bajarilmagan.
+Holat: kod tekshirilgan; hostingda Telegram buyruqlari ishladi, AI natijasi hali tasdiqlanmagan.
 Bot: @Urgench10QavatNazorat_bot. Maxfiy kalitlar paketga kiritilmagan.
 
 Imkoniyatlar
@@ -7,8 +7,17 @@ Imkoniyatlar
 - Egasi rasmlarga/video xabarlariga Reply qilib /tahlil yuborishi mumkin.
 - Video: 19 MB va 3 daqiqagacha, 6 ta teng taqsimlangan kadr. Audio tekshirilmaydi.
 - Egasi /status orqali oxirgi 7 kun qaydlaridan status oladi.
-- Belgilangan guruhdagi yangi media avtomatik tahlil qilinadi; AUTO_ANALYZE eski sozlamasi ishlatilmaydi. Kunlik so'rov limiti saqlanadi.
+- Yangi media avtomatik tahlil qilinadi; eski AUTO_ANALYZE sozlamasi ishlatilmaydi.
+- Oddiy matnlar 5 daqiqalik to'plamda AI kuzatuvidan o'tadi; bayonotlar tekshirilmagan deb belgilanadi.
+- Kunlik hisobot 20:00, haftalik juma 19:00 (Asia/Tashkent), buyruqsiz yuboriladi.
+- Muddati o'tgan ochiq vazifalar har kuni 09:00 dan keyin eslatiladi.
+- /vazifa YYYY-MM-DD | mas'ul | ish — faqat egasi tasdiqlagan reja.
+- /vazifalar — ro'yxat; /bajarildi ID — egasi bajarilganini tasdiqlaydi.
+- /bugun — 1 kunlik hisobot; /holat — AI muvaffaqiyati, xato va kunlik sarflangan so'rovlar.
+- AI tavsiyasi vazifa yaratmaydi va bajarilganligini tasdiqlamaydi.
 - Har kuni Toshkent sanasi bo'yicha maksimum 10 AI urinish (o'zgartirish mumkin).
+  Shundan 2 so'rov hisobotlar uchun saqlanadi. Limitda xabarlar qayd qilinadi,
+  matn tahlili navbatda qoladi, yangi media AI tahlili o'tkazib yuborilishi mumkin.
 Bu pul bo'yicha qat'iy limit emas: tokenlar va model narxi xarajatni belgilaydi.
 - Faqat TELEGRAM_CHAT_ID bilan ko'rsatilgan bitta guruhni kuzatadi.
 - baseline.json tasdiqlangan qiymatlar uchun o'zgarmas manba: bot uni yozmaydi.
@@ -31,7 +40,10 @@ Ishga tushirish (serverga o'rnatuvchi uchun)
 
 Cheklovlar va ma'lumotlar
 - Bu chatning haftalik avtomatizatsiyasi bilan Telegram bot ulanmagan.
-- Telegramda avtomatik haftalik yuborish hali yo'q; /status qo'lda chaqiriladi.
+- Telegram hisobotlarini botning o'zi yuboradi; server o'chiq bo'lsa yubora olmaydi.
+  Shu kun ichida qayta ishga tushsa o'tgan hisobot vaqtidan keyin bir marta yuboradi.
+  Muvaffaqiyatli yuborish holati SQLite'da saqlanadi; uzilish aynan yuborish vaqtida
+  yuz bersa hisobot takrorlanishi mumkin.
 - Bot oldingi guruh tarixini to'liq o'qimaydi; faqat kelgan updatesni saqlaydi.
 - Albomdagi har bir rasm alohida tahlil qilinadi. PNG hujjatlar hozir qo'llanmaydi;
   Telegram photo yoki JPEG hujjat yuboring.
@@ -51,5 +63,6 @@ https://core.telegram.org/bots/features#privacy-mode
 https://developers.openai.com/api/docs/guides/images-vision
 https://developers.openai.com/api/docs/quickstart
 
-Sinovlar: test_bot.py — buyruq ajratish, javob matni, kunlik limit,
-baseline o'zgarmasligi, boshqa guruhlar va bot xabarlarini rad etish.
+Sinovlar: test_bot.py — buyruq/caption, kunlik limit va hisobot zaxirasi,
+baseline o'zgarmasligi, guruh/egasi izolyatsiyasi, vazifalar, sana tekshiruvi,
+hisobot takrorlanmasligi, qayta ishga tushishda saqlash, matn navbati.
