@@ -11,6 +11,57 @@ from zoneinfo import ZoneInfo
 from bot import Bot, LimitReached, ServiceError, command, response_text, split_text
 
 class Tests(unittest.TestCase):
+    def test_audio_and_video_are_combined_with_transcript(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                msg = dict(chat={'id':-100123}, **{'from':{'id':2}},
+                           message_id=60, date=bot.started, voice={'file_id':'fake'})
+                with patch.object(bot, 'download', return_value=b'media'), \
+                     patch.object(bot, 'audio_bytes', return_value=b'mp3'), \
+                     patch.object(bot, 'transcribe', return_value='Қолип тугамади') as transcribe, \
+                     patch.object(bot, 'images', return_value=[(b'jpg','frame')]) as images, \
+                     patch.object(bot, 'ai', return_value='Таҳлил') as ai, \
+                     patch.object(bot, 'send') as send:
+                    bot.handle(msg)
+                    images.assert_not_called()
+                    self.assertIn('Қолип тугамади', str(ai.call_args))
+                    self.assertTrue(any('Овоздан матн' in x.args[0] for x in send.call_args_list))
+                    bot.handle(msg)
+                    self.assertEqual(transcribe.call_count, 1)
+                    video = {k:v for k,v in msg.items() if k!='voice'}
+                    video.update(message_id=61, video={'file_id':'fake'})
+                    bot.handle(video)
+                    images.assert_called_once_with(video, raw=b'media')
+                    self.assertTrue(any(x['type']=='input_image' for x in ai.call_args.args[0]))
+                    self.assertIn('Қолип тугамади', str(ai.call_args))
+                bot.db.close()
+
+    def test_transcription_multipart_and_reserved_analysis_slot(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d, MAX_DAILY_CALLS='4')
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                with patch('urllib.request.urlopen') as urlopen:
+                    urlopen.return_value.__enter__.return_value = io.BytesIO(b'{"text":"speech"}')
+                    self.assertEqual(bot.transcribe(b'mp3-data'), 'speech')
+                    request = urlopen.call_args.args[0]
+                    self.assertIn(b'filename="audio.mp3"', request.data)
+                    self.assertIn(b'mp3-data', request.data)
+                    self.assertIn(b'gpt-4o-mini-transcribe', request.data)
+                    self.assertIn(b'\r\n', request.data)
+                    self.assertNotIn(b'fake', request.data)
+                    with self.assertRaises(LimitReached):
+                        bot.transcribe(b'mp3-data')
+                    self.assertEqual(urlopen.call_count, 1)
+                    bot.reserve()  # The analysis slot is still available.
+                bot.db.close()
+
     def test_setup_only_discloses_current_ids(self):
         with tempfile.TemporaryDirectory() as d:
             env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
