@@ -4,6 +4,8 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from bot import Bot, LimitReached, command, response_text, split_text
 
 class Tests(unittest.TestCase):
@@ -69,6 +71,72 @@ class Tests(unittest.TestCase):
                     bot.handle({**msg, 'chat':{'id':5}})
                     bot.handle({**msg, 'date':bot.started-1})
                     analyze.assert_not_called()
+                bot.db.close()
+
+    def test_tasks_schedule_and_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                msg = dict(chat={'id':-100123}, **{'from':{'id':1}},
+                           message_id=30, date=bot.started,
+                           text='/vazifa 2026-10-01 | Жумонбек | Қолип')
+                with patch.object(bot, 'send') as send, patch.object(bot, 'status') as status:
+                    bot.handle({**msg, 'from':{'id':2}})
+                    self.assertEqual(bot.db.execute('SELECT count(*) FROM tasks').fetchone()[0], 0)
+                    bot.handle(msg)
+                    self.assertIn('Жумонбек', bot.task_summary())
+                    bot.handle({**msg, 'text':'/vazifa 2026-99-99 | A | B'})
+                    self.assertEqual(bot.db.execute('SELECT count(*) FROM tasks').fetchone()[0], 1)
+                    now = datetime(2026,10,9,20,0,tzinfo=ZoneInfo('Asia/Tashkent'))
+                    bot.scheduled(now)
+                    self.assertEqual([c.args for c in status.call_args_list], [(7,), (1,)])
+                    bot.scheduled(now)
+                    self.assertEqual(status.call_count, 2)
+                    self.assertTrue(any('Муддати ўтган' in c.args[0] for c in send.call_args_list))
+                    bot.handle({**msg, 'text':'/bajarildi 1'})
+                    self.assertEqual(bot.db.execute('SELECT status FROM tasks').fetchone()[0], 'done')
+                since = bot.monitor_since
+                bot.db.close()
+                restored = Bot()
+                self.assertEqual(restored.monitor_since, since)
+                with patch.object(restored, 'status') as status:
+                    restored.scheduled(now)
+                    status.assert_not_called()
+                self.assertEqual(restored.db.execute('SELECT status FROM tasks').fetchone()[0], 'done')
+                restored.db.close()
+
+    def test_reports_and_text_queue(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d, MAX_DAILY_CALLS='3')
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                bot.reserve()
+                with self.assertRaises(LimitReached):
+                    bot.reserve()
+                bot.reserve(report=True)
+                bot.reserve(report=True)
+                with self.assertRaises(LimitReached):
+                    bot.reserve(report=True)
+                msg = dict(chat={'id':-100123}, **{'from':{'id':2}},
+                           message_id=40, date=bot.started, text='Қолип ҳали тугамади')
+                bot.handle(msg)
+                now = datetime(2026,10,8,1,0,tzinfo=ZoneInfo('Asia/Tashkent'))
+                with patch.object(bot, 'ai', side_effect=LimitReached), patch.object(bot, 'send') as send:
+                    bot.status(1)
+                    self.assertIn('лимит', send.call_args.args[0])
+                    with self.assertRaises(LimitReached):
+                        bot.scheduled(now)
+                    self.assertEqual(bot.get_state('text_cursor'), '')
+                bot.set_state('text_check', 0)
+                with patch.object(bot, 'ai', return_value='Тугамаган иш ҳақида баёнот') as ai, patch.object(bot, 'send'):
+                    bot.scheduled(now)
+                    ai.assert_called_once()
+                    self.assertTrue(bot.get_state('text_cursor'))
                 bot.db.close()
 
     def test_response(self):
