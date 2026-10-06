@@ -182,6 +182,14 @@ class Bot:
                 self.tg('sendMessage', chat_id=m['chat']['id'],
                         text=f"Chat ID: {m['chat']['id']}\nUser ID: {m['from']['id']}\nСозлаш режими: таҳлил ҳали ёқилмаган.")
             return
+        if cmd == '/id':
+            actual_chat = m.get('chat', {}).get('id')
+            actual_user = m.get('from', {}).get('id')
+            if actual_chat and actual_user:
+                note = 'Гуруҳ созламаси мос.' if actual_chat == self.chat else 'Гуруҳ ID созламаси мос эмас; Render TELEGRAM_CHAT_ID ни текширинг.'
+                self.tg('sendMessage', chat_id=actual_chat,
+                        text=f"Chat ID: {actual_chat}\nUser ID: {actual_user}\n{note}")
+            return
         if m.get('chat',{}).get('id') != self.chat:
             return
         if cmd == '/start':
@@ -190,6 +198,7 @@ class Bot:
             self.send(f"Group ID: {self.chat}\nUser ID: {m.get('from',{}).get('id')}",m['message_id'])
         elif cmd in ('/status','/tahlil'):
             if m.get('from',{}).get('id') != self.owner:
+                self.send('Бу буйруқ бот эгаси учун. Render OWNER_TELEGRAM_USER_ID ни текширинг.', m['message_id'])
                 return
             if cmd == '/status':
                 self.status()
@@ -207,6 +216,7 @@ class Bot:
                     self.analyze(m)
 
     def run(self):
+        print(f'Bot starting: chat={self.chat}, owner={self.owner}, model={self.model}, auto={self.auto}', flush=True)
         if self.tg('getWebhookInfo').get('url'):
             raise RuntimeError('Existing webhook: remove it deliberately before polling.')
         while True:
