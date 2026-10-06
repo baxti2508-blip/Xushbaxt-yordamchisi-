@@ -11,6 +11,41 @@ from zoneinfo import ZoneInfo
 from bot import Bot, LimitReached, ServiceError, command, response_text, split_text
 
 class Tests(unittest.TestCase):
+    def test_defect_owner_evidence_dedup_and_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                msg = dict(chat={'id':-100123}, **{'from':{'id':2}},
+                           message_id=90, date=bot.started,
+                           text='/nuqson 2026-10-08 | Уста | 6-қават А-1 | Чизма билан солиштириш')
+                with patch.object(bot, 'send'):
+                    bot.handle(msg)
+                    self.assertEqual(bot.db.execute('SELECT count(*) FROM defects').fetchone()[0], 0)
+                    msg['from']['id'] = 1
+                    msg['text'] = '/nuqson 2026-02-30 | Уста | А-1 | Камчилик'
+                    bot.handle(msg)
+                    self.assertEqual(bot.db.execute('SELECT count(*) FROM defects').fetchone()[0], 0)
+                    msg['text'] = '/nuqson 2026-10-08 | Уста | 6-қават А-1 | Чизма билан солиштириш'
+                    bot.handle(msg)
+                    bot.handle(msg)
+                    self.assertEqual(bot.db.execute('SELECT count(*) FROM defects').fetchone()[0], 1)
+                    msg.update(message_id=91, text='/yopildi 1')
+                    bot.handle(msg)
+                    self.assertEqual(bot.db.execute('SELECT status FROM defects').fetchone()[0], 'open')
+                bot.db.close()
+                bot = Bot()
+                self.assertIn('6-қават А-1', bot.defect_summary())
+                msg['reply_to_message'] = {'message_id':92, 'photo':[{'file_id':'fake'}]}
+                with patch.object(bot, 'send'), patch.object(bot, 'ai') as ai:
+                    bot.handle(msg)
+                    ai.assert_not_called()
+                self.assertEqual(bot.db.execute('SELECT status,evidence,closed_by FROM defects').fetchone(),
+                                 ('closed', 92, 1))
+                bot.db.close()
+
     def test_voice_reminders_daily_restart_cache_and_retry(self):
         with tempfile.TemporaryDirectory() as d:
             env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
