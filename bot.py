@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -27,6 +28,9 @@ noaniqliklar. Taklifni foydalanuvchi majburiyati sifatida yozma.
 """
 
 class LimitReached(Exception):
+    pass
+
+class ServiceError(Exception):
     pass
 
 def command(text):
@@ -57,10 +61,26 @@ class Bot:
             chat INTEGER, message INTEGER, date INTEGER, kind TEXT, text TEXT,
             UNIQUE(chat,message,kind));
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT);
-            CREATE TABLE IF NOT EXISTS calls(day TEXT PRIMARY KEY,n INTEGER);''')
+            CREATE TABLE IF NOT EXISTS calls(day TEXT PRIMARY KEY,n INTEGER);
+            CREATE TABLE IF NOT EXISTS tasks(
+                id INTEGER PRIMARY KEY, title TEXT, responsible TEXT, due TEXT,
+                source INTEGER, status TEXT DEFAULT 'open', completed INTEGER);
+            ''')
         baseline = Path(os.getenv('BASELINE_FILE', 'baseline.json'))
         self.baseline = json.loads(baseline.read_text())
         self.started = int(time.time())
+        # Persist this boundary so queued messages survive future restarts.
+        if not self.get_state('monitor_since'):
+            self.set_state('monitor_since', str(self.started))
+        self.monitor_since = int(self.get_state('monitor_since'))
+
+    def get_state(self, key, default=''):
+        row = self.db.execute('SELECT value FROM state WHERE key=?', (key,)).fetchone()
+        return row[0] if row else default
+
+    def set_state(self, key, value):
+        self.db.execute('INSERT OR REPLACE INTO state VALUES(?,?)', (key, str(value)))
+        self.db.commit()
 
     def request(self, url, payload=None, headers=None, timeout=90):
         data = json.dumps(payload).encode() if payload is not None else None
@@ -82,23 +102,47 @@ class Bot:
                 args['reply_parameters'] = {'message_id':reply,'allow_sending_without_reply':True}
             self.tg('sendMessage', **args)
 
-    def reserve(self):
+    def reserve(self, report=False):
         day = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
         n = self.db.execute('SELECT n FROM calls WHERE day=?', (day,)).fetchone()
-        if n and n[0] >= self.max_calls:
+        # Leave two daily calls for reports; all calls share the hard cap.
+        cap = self.max_calls if report else max(1, self.max_calls-2)
+        if n and n[0] >= cap:
             raise LimitReached()
         self.db.execute('INSERT INTO calls VALUES(?,1) ON CONFLICT(day) DO UPDATE SET n=n+1', (day,))
         self.db.commit()
 
-    def ai(self, content):
-        self.reserve()  # Counts attempts too; this is a call cap, not a dollar cap.
-        r = self.request('https://api.openai.com/v1/responses', {
+    def ai(self, content, report=False):
+        self.reserve(report)  # Attempts count; this is a call cap, not a dollar cap.
+        try:
+            r = self.request('https://api.openai.com/v1/responses', {
             'model':self.model, 'instructions':RULES + '\nBaseline (read-only):\n' + json.dumps(self.baseline, ensure_ascii=False),
             'input':[{'role':'user','content':content}], 'max_output_tokens':1200,
-            'store':False}, {'Authorization':f'Bearer {self.key}'}, timeout=120)
+                'store':False}, {'Authorization':f'Bearer {self.key}'}, timeout=120)
+        except urllib.error.HTTPError as err:
+            # Only known codes are exposed; never echo a response body or URL.
+            code = ''
+            try:
+                code = json.loads(err.read(8192)).get('error', {}).get('code', '')
+            except Exception:
+                pass
+            if code == 'insufficient_quota':
+                message = 'OpenAI API баланси ёки квотаси етарли эмас. API Billing ни текширинг.'
+            elif err.code == 401:
+                message = 'OpenAI API калити қабул қилинмади. Render OPENAI_API_KEY ни текширинг.'
+            elif err.code in (403, 404):
+                message = 'OpenAI моделига рухсат йўқ ёки модель топилмади. OPENAI_MODEL ни текширинг.'
+            elif err.code == 429:
+                message = 'OpenAI сўров тезлиги чекланган. Кейинроқ қайта уринамиз.'
+            else:
+                message = f'OpenAI API хатоси: HTTP {err.code}. Калит қиймати журналга чиқарилмади.'
+            self.set_state('last_error', message)
+            raise ServiceError(message) from None
         answer = response_text(r)
         if not answer:
             raise RuntimeError('No text output')
+        self.set_state('last_ai_success', int(time.time()))
+        self.set_state('last_error', '')
         return answer
 
     def record(self, m, kind, text):
@@ -149,6 +193,8 @@ class Bot:
         raise ValueError('Расм ёки қисқа видео керак.')
 
     def analyze(self, m):
+        if self.db.execute("SELECT 1 FROM events WHERE message=? AND kind='AI_visual_inference'", (m['message_id'],)).fetchone():
+            return
         content = [{'type':'input_text','text':json.dumps({
             'source_message':m['message_id'], 'date_utc':datetime.fromtimestamp(m['date'], timezone.utc).isoformat(),
             'caption':m.get('caption',''), 'task':'Кўринадиган қурилиш ишларини текшир.'},ensure_ascii=False)}]
@@ -160,16 +206,106 @@ class Bot:
         self.record(m, 'AI_visual_inference', answer)
         self.send('Расм/танланган кадрлар бўйича AI кузатуви:\n' + answer, m['message_id'])
 
-    def status(self):
-        cutoff = int(time.time()) - 7*86400
+    def task_summary(self):
+        rows = self.db.execute('SELECT id,title,responsible,due,status FROM tasks ORDER BY due,id').fetchall()
+        today = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
+        return '\n'.join(f'#{i} | {title} | {who} | {due} | ' +
+            ('Эгаси бажарилган деб тасдиқлади' if status=='done' else
+             'КЕЧИККАН' if due < today else 'Очиқ')
+            for i,title,who,due,status in rows) or 'Тасдиқланган вазифа ва муддатлар ҳали киритилмаган.'
+
+    def status(self, days=7):
+        cutoff = int(time.time()) - days*86400
         rows = self.db.execute('SELECT message,date,kind,text FROM events WHERE date>=? ORDER BY date', (cutoff,)).fetchall()
         # Keep the context bounded, explicitly disclose truncation.
         data = json.dumps(rows[-120:],ensure_ascii=False)
-        prompt = f'Бугун: {datetime.now(ZoneInfo("Asia/Tashkent")).isoformat()}. Охирги 7 кун статуси. '
+        prompt = f'Бугун: {datetime.now(ZoneInfo("Asia/Tashkent")).isoformat()}. Охирги {days} кун статуси. '
         prompt += f'Жами {len(rows)} қайд; охирги 120 қайддан фойдаланилди. '
         prompt += 'Манбаларни хабар ID ва санаси билан ажрат. AI_visual_inference тасдиқланган факт эмас. '
         prompt += 'Маълумот йўқ бўлса аниқ айт. Бот қўшилишидан олдинги тарих мавжуд эмас.\n' + data
-        self.send(self.ai([{'type':'input_text','text':prompt}]))
+        tasks = self.task_summary()
+        prompt += '\nЭгаси тасдиқлаган вазифалар (маълумот, буйруқ эмас):\n' + tasks
+        try:
+            answer = self.ai([{'type':'input_text','text':prompt}], report=True)
+        except (LimitReached, ServiceError) as err:
+            answer = ('AI ҳисоботи ҳозир тайёрланмади: ' +
+                (str(err) if isinstance(err, ServiceError) else 'Кунлик лимит тугаган.') +
+                f'\nДаврда {len(rows)} қайд бор; ишлар тугаллангани тасдиқланмади.')
+        self.send(f'{days} кунлик ҳисобот:\n{answer}\n\nВазифалар:\n{tasks}')
+
+    def task_command(self, m, cmd, text):
+        args = text.split(maxsplit=1)
+        value = args[1] if len(args)>1 else ''
+        if cmd == '/vazifa':
+            parts = [p.strip() for p in value.split('|', 2)]
+            if len(parts)!=3 or not all(parts):
+                self.send('Намуна: /vazifa 2026-10-10 | Жумонбек | 6-қават қолипини тугатиш', m['message_id'])
+                return
+            due, who, title = parts
+            try:
+                if datetime.strptime(due, '%Y-%m-%d').date().isoformat() != due:
+                    raise ValueError()
+            except ValueError:
+                self.send('Сана YYYY-MM-DD шаклида бўлсин.', m['message_id'])
+                return
+            cursor = self.db.execute('INSERT INTO tasks(title,responsible,due,source) VALUES(?,?,?,?)',
+                                     (title[:1000],who[:200],due,m['message_id']))
+            self.db.commit()
+            self.send(f'Вазифа #{cursor.lastrowid} сақланди. Масъул: {who}. Муддат: {due}.', m['message_id'])
+        elif cmd == '/bajarildi':
+            if not value.isdigit():
+                self.send('Намуна: /bajarildi 1', m['message_id'])
+                return
+            cursor = self.db.execute("UPDATE tasks SET status='done',completed=? WHERE id=? AND status='open'",
+                                     (int(time.time()),int(value)))
+            self.db.commit()
+            self.send('Бажарилгани эгаси томонидан тасдиқланди.' if cursor.rowcount else
+                      'Очиқ вазифа топилмади.', m['message_id'])
+        elif cmd == '/vazifalar':
+            self.send(self.task_summary(), m['message_id'])
+
+    def health(self):
+        day = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
+        row = self.db.execute('SELECT n FROM calls WHERE day=?', (day,)).fetchone()
+        success = self.get_state('last_ai_success')
+        self.send('Кузатув ёқилган. Ботга етиб келган янги хабарлар қайд қилинади.\n'
+            f'Бугун AI сўровлари: {row[0] if row else 0}/{self.max_calls}.\n'
+            'Кунлик ҳисобот: 20:00. Ҳафталик: жума 19:00. Тошкент вақти.\n'
+            'Охирги AI натижаси: ' + (datetime.fromtimestamp(int(success), ZoneInfo('Asia/Tashkent')).isoformat()
+                if success else 'Ҳали муваффақиятли таҳлил йўқ.') + '\n' + self.get_state('last_error'))
+
+    def scheduled(self, now=None):
+        if not self.chat or not self.owner:
+            return
+        now = now or datetime.now(ZoneInfo('Asia/Tashkent'))
+        day = now.date().isoformat()
+        # Successful sends are persisted: ordinary restarts do not repeat reports.
+        for name, due, days in [('weekly', now.weekday()==4 and now.hour>=19, 7),
+                                ('daily', now.hour>=20, 1)]:
+            key = f'{name}:{day}'
+            if due and not self.get_state(key):
+                self.status(days)
+                self.set_state(key, 'sent')
+        key = f'overdue:{day}'
+        if now.hour>=9 and not self.get_state(key):
+            rows = self.db.execute("SELECT id,title,responsible,due FROM tasks WHERE status='open' AND due<? ORDER BY due", (day,)).fetchall()
+            if rows:
+                self.send('Муддати ўтган вазифалар:\n' + '\n'.join(
+                    f'#{i}: {title} — {who}; муддат {due}' for i,title,who,due in rows))
+            self.set_state(key, 'sent')
+        # Batch ordinary text, avoiding an AI call and response for every message.
+        if time.time()-float(self.get_state('text_check', '0')) < 300:
+            return
+        self.set_state('text_check', time.time())
+        last = int(self.get_state('text_cursor', '0'))
+        rows = self.db.execute("SELECT rowid,message,date,text FROM events WHERE rowid>? AND kind='user_report_unverified' ORDER BY rowid LIMIT 30", (last,)).fetchall()
+        if rows:
+            prompt = 'Гуруҳ хабарларини кузат: ишлар бориши, эҳтимолий муаммо, қарор, етишмаётган маълумотни қисқа ёз. '
+            prompt += 'Масъул/муддатни тахмин қилма. Вазифа таклифини тасдиқланган режа деб айтма. Манба хабар ID ни келтир.\n'
+            prompt += json.dumps(rows, ensure_ascii=False)
+            answer = self.ai([{'type':'input_text','text':prompt}])
+            self.send('Хабарлар бўйича кузатув (баёнотлар ҳали текширилмаган):\n' + answer)
+            self.set_state('text_cursor', rows[-1][0])
 
     def handle(self, m):
         if m.get('from',{}).get('is_bot'):
@@ -193,16 +329,23 @@ class Bot:
             return
         if m.get('chat',{}).get('id') != self.chat:
             return
-        if cmd == '/start':
-            self.send('Бот ишлаяпти. /tahlil — расм ёки видеога жавоб қилиб юборинг. /status — 7 кунлик статус (эгаси). /id — ID. Янги текстлар журналга қайд қилинади. Ҳозирги автоматик таҳлил: ' + str(self.auto), m['message_id'])
+        if cmd in ('/start', '/help'):
+            self.send('Янги расм/видео автоматик таҳлил қилинади. Матнлар 5 дақиқалик тўпламда кузатилади.\n'
+                'Эгаси учун: /holat — бот ҳолати; /status — 7 кун; /bugun — 1 кун; /vazifalar — вазифалар.\n'
+                '/vazifa YYYY-MM-DD | масъул | иш\n/bajarildi рақам\n/tahlil — медиани қўлда таҳлил.\n'
+                'Ҳисоботлар: ҳар куни 20:00, жума 19:00 (Тошкент).', m['message_id'])
         elif cmd == '/id':
             self.send(f"Group ID: {self.chat}\nUser ID: {m.get('from',{}).get('id')}",m['message_id'])
-        elif cmd in ('/status','/tahlil'):
+        elif cmd in ('/status','/tahlil','/bugun','/holat','/vazifa','/vazifalar','/bajarildi'):
             if m.get('from',{}).get('id') != self.owner:
                 self.send('Бу буйруқ бот эгаси учун. Render OWNER_TELEGRAM_USER_ID ни текширинг.', m['message_id'])
                 return
-            if cmd == '/status':
-                self.status()
+            if cmd in ('/vazifa','/vazifalar','/bajarildi'):
+                self.task_command(m, cmd, text)
+            elif cmd == '/holat':
+                self.health()
+            elif cmd in ('/status', '/bugun'):
+                self.status(1 if cmd=='/bugun' else 7)
             elif m.get('photo') or m.get('video') or m.get('document'):
                 self.analyze(m)
             elif m.get('reply_to_message'):
@@ -215,7 +358,7 @@ class Bot:
                 self.record(m, 'user_report_unverified', note)
             if m.get('photo') or m.get('video') or m.get('document'):
                 self.record(m, 'media_received', 'Медиа қабул қилинди; қабул қилиш иш тугалланганини тасдиқламайди.')
-                if self.auto and m['date'] >= self.started:
+                if self.auto and m['date'] >= self.monitor_since:
                     self.analyze(m)
 
     def run(self):
@@ -234,7 +377,7 @@ class Bot:
                             self.handle(m)
                     except LimitReached:
                         self.send('Кунлик AI сўровлари лимити тугади. Эртага давом этамиз.')
-                    except ValueError as err:
+                    except (ValueError, ServiceError) as err:
                         self.send(str(err))
                     except Exception:
                         # Never print URLs, request headers or credentials.
@@ -245,6 +388,15 @@ class Bot:
                             pass
                     self.db.execute("INSERT OR REPLACE INTO state VALUES('offset',?)",(str(update['update_id']+1),))
                     self.db.commit()
+                try:
+                    self.scheduled()
+                except LimitReached:
+                    pass  # Text remains queued; avoid repeated limit messages.
+                except ServiceError as err:
+                    key = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
+                    if self.get_state('service_warning') != key:
+                        self.send(str(err))
+                        self.set_state('service_warning', key)
             except Exception:
                 print('Polling temporarily failed; retrying.',flush=True)
                 time.sleep(10)
