@@ -53,6 +53,24 @@ class Tests(unittest.TestCase):
                     self.assertIn('OWNER_TELEGRAM_USER_ID', send.call_args.args[0])
                 bot.db.close()
 
+    def test_automatic_media_only_in_configured_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d, AUTO_ANALYZE='false')
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                msg = dict(chat={'id':-100123}, **{'from':{'id':2}},
+                           message_id=20, date=bot.started, video={'file_id':'fake'})
+                with patch.object(bot, 'analyze') as analyze:
+                    bot.handle(msg)
+                    analyze.assert_called_once_with(msg)
+                    analyze.reset_mock()
+                    bot.handle({**msg, 'chat':{'id':5}})
+                    bot.handle({**msg, 'date':bot.started-1})
+                    analyze.assert_not_called()
+                bot.db.close()
+
     def test_response(self):
         self.assertEqual(response_text({'output':[{'content':[{'type':'output_text','text':'ok'}]}]}),'ok')
         self.assertEqual(command('/status@Urgench10QavatNazorat_bot'),'/status')
