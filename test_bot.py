@@ -1,4 +1,6 @@
 import json
+import io
+import urllib.error
 import os
 from pathlib import Path
 import tempfile
@@ -6,7 +8,7 @@ import unittest
 from unittest.mock import patch
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from bot import Bot, LimitReached, command, response_text, split_text
+from bot import Bot, LimitReached, ServiceError, command, response_text, split_text
 
 class Tests(unittest.TestCase):
     def test_setup_only_discloses_current_ids(self):
@@ -137,6 +139,26 @@ class Tests(unittest.TestCase):
                     bot.scheduled(now)
                     ai.assert_called_once()
                     self.assertTrue(bot.get_state('text_cursor'))
+                bot.db.close()
+
+    def test_quota_and_rate_errors_are_distinct_and_private(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                cases = [('organization_spend_limit_exceeded', 'insufficient_quota', 'баланси'),
+                         ('rate_limit_exceeded', 'rate_limit_error', 'тезлиги'),
+                         (None, None, 'баланс/квота')]
+                for code, kind, expected in cases:
+                    body = json.dumps({'error':{'code':code,'type':kind,'message':'secret-never-echo'}}).encode()
+                    error = urllib.error.HTTPError('https://example.invalid',429,'error',{},io.BytesIO(body))
+                    with patch.object(bot, 'reserve'), patch.object(bot, 'request', side_effect=error):
+                        with self.assertRaises(ServiceError) as raised:
+                            bot.ai([])
+                        self.assertIn(expected, str(raised.exception))
+                        self.assertNotIn('secret-never-echo', bot.get_state('last_error'))
                 bot.db.close()
 
     def test_response(self):
