@@ -645,6 +645,36 @@ class Bot:
         elif cmd == '/vazifalar':
             self.send(self.task_summary(), m['message_id'])
 
+    def startup_check(self):
+        if not self.chat or not self.owner:
+            return
+        version = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:10]
+        if self.get_state('startup_checked_version') == version:
+            return
+        if int(self.get_state('startup_check_retry_at', '0')) > time.time():
+            return
+        me = self.tg('getMe')
+        member = self.tg('getChatMember', chat_id=self.chat, user_id=me['id'])
+        status = member.get('status')
+        if status in ('left', 'kicked'):
+            raise ServiceError('Бот белгиланган гуруҳ аъзоси эмас.')
+        access = status in ('administrator', 'creator') or bool(me.get('can_read_all_group_messages'))
+        text = f'Бот янгиланди. Версия: {version}. @{me.get("username", "номаълум")}\n'
+        if access:
+            text += 'Гуруҳ хабарларини олиш рухсати бор. Янги видео, расм ва овоз учун /tahlil талаб қилинмайди. '
+            text += 'Бу рухсат текшируви; видео таҳлили муваффақияти ҳали алоҳида текширилади.'
+        else:
+            text += ('Автоматик таҳлилга Telegram Privacy Mode тўсқинлик қиляпти: '
+                     'бот оддий видео хабарларни ололмайди. Гуруҳ администратори ботга '
+                     'администратор мақомини бериши ёки BotFather /setprivacy ни ўчириши керак. '
+                     'Бу рухсатни ботнинг ўзи ўзгартира олмайди.')
+        pending = self.db.execute('SELECT count(*) FROM media_queue WHERE attempts<3').fetchone()[0]
+        text += f'\nАвтоматик қайта ишлаш навбати: {pending}.'
+        if self.get_state('last_media_error'):
+            text += '\nОхирги медиа хатоси: ' + self.get_state('last_media_error')
+        self.send(text)
+        self.set_state('startup_checked_version', version)
+
     def health(self):
         access = 'Гуруҳ медиасини ўқиш рухсатини текшириб бўлмади.'
         try:
@@ -834,6 +864,11 @@ class Bot:
             raise RuntimeError('Existing webhook: remove it deliberately before polling.')
         while True:
             try:
+                try:
+                    self.startup_check()
+                except Exception:
+                    self.set_state('startup_check_retry_at', int(time.time())+300)
+                    print('Startup permission check failed; polling continues.', flush=True)
                 row = self.db.execute("SELECT value FROM state WHERE key='offset'").fetchone()
                 updates = self.tg('getUpdates',offset=int(row[0]) if row else 0,
                                   timeout=40,allowed_updates=['message'])
