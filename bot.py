@@ -122,18 +122,26 @@ class Bot:
         except urllib.error.HTTPError as err:
             # Only known codes are exposed; never echo a response body or URL.
             code = ''
+            kind = ''
             try:
-                code = json.loads(err.read(8192)).get('error', {}).get('code', '')
+                detail = json.loads(err.read(8192)).get('error', {})
+                code = detail.get('code', '')
+                kind = detail.get('type', '')
             except Exception:
                 pass
-            if code == 'insufficient_quota':
+            if kind == 'insufficient_quota' or code in ('insufficient_quota',
+                    'organization_spend_limit_exceeded', 'organization_usage_limit_exceeded',
+                    'project_spend_limit_exceeded'):
                 message = 'OpenAI API баланси ёки квотаси етарли эмас. API Billing ни текширинг.'
             elif err.code == 401:
                 message = 'OpenAI API калити қабул қилинмади. Render OPENAI_API_KEY ни текширинг.'
             elif err.code in (403, 404):
                 message = 'OpenAI моделига рухсат йўқ ёки модель топилмади. OPENAI_MODEL ни текширинг.'
             elif err.code == 429:
-                message = 'OpenAI сўров тезлиги чекланган. Кейинроқ қайта уринамиз.'
+                if code in ('rate_limit_exceeded', 'slow_down') or kind == 'rate_limit_error':
+                    message = 'OpenAI сўров тезлиги чекланган. Кейинроқ қайта уринамиз.'
+                else:
+                    message = 'OpenAI HTTP 429: API баланс/квота ёки сўров тезлиги чекланган. Billing ва Limits ни текширинг.'
             else:
                 message = f'OpenAI API хатоси: HTTP {err.code}. Калит қиймати журналга чиқарилмади.'
             self.set_state('last_error', message)
