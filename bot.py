@@ -479,15 +479,16 @@ class Bot:
         self.db.commit()
 
     def record_answer(self, m):
+        """Return whether a text reply belongs to the immediate dialogue."""
         reply = m.get('reply_to_message', {}).get('message_id')
         if not reply:
-            return
+            return False
         row = self.db.execute('SELECT source FROM questions WHERE source=? OR question_message=?',
                               (reply,reply)).fetchone()
         if not row:
             row = self.db.execute('SELECT source FROM dialogue WHERE message=?', (reply,)).fetchone()
         if not row:
-            return
+            return False
         note = m.get('text') or m.get('caption') or 'Медиа жавоб; таҳлил алоҳида қайд қилинади.'
         self.record(m, 'clarification_unverified',
                     f'Манба #{row[0]} учун жавоб; юборувчи #{m.get("from",{}).get("id")}:\n' + note)
@@ -495,10 +496,10 @@ class Bot:
             (m['message_id'],m.get('from',{}).get('id'),row[0]))
         self.db.commit()
         if not m.get('text'):
-            return
+            return False
         source = row[0]
         if self.db.execute("SELECT 1 FROM dialogue WHERE message=? AND role='user'", (m['message_id'],)).fetchone():
-            return
+            return True
         history = self.db.execute('SELECT role,text FROM dialogue WHERE source=? ORDER BY rowid DESC LIMIT 12',
                                  (source,)).fetchall()[::-1]
         initial = self.db.execute('SELECT question FROM questions WHERE source=?', (source,)).fetchone()
@@ -518,6 +519,7 @@ class Bot:
             self.db.execute('INSERT OR IGNORE INTO dialogue VALUES(?,?,?,?)',
                             (sent,source,'assistant',answer[:6000]))
         self.db.commit()
+        return True
 
     def inspection_command(self, m, cmd, text):
         if cmd == '/nazorat':
@@ -843,9 +845,9 @@ class Bot:
                 self.send('Telegram бу буйруқ билан видео файл маълумотини ботга етказмади. '
                           'Таҳлил бошланмади; бу сизнинг Reply қилишингиз нотўғри дегани эмас.', m['message_id'])
         else:
-            self.record_answer(m)
+            dialogue_reply = self.record_answer(m)
             note = text or m.get('caption', '')
-            if note:
+            if note and not dialogue_reply:
                 self.record(m, 'user_report_unverified', note)
             if m.get('photo') or m.get('video') or m.get('document') or m.get('voice') or m.get('audio'):
                 self.record(m, 'media_received', 'Медиа қабул қилинди; қабул қилиш иш тугалланганини тасдиқламайди.')
