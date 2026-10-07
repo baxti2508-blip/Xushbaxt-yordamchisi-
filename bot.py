@@ -700,6 +700,9 @@ class Bot:
             'Охирги AI натижаси: ' + (datetime.fromtimestamp(int(success), ZoneInfo('Asia/Tashkent')).isoformat()
                 if success else 'Ҳали муваффақиятли таҳлил йўқ.') + '\n'
             f'Қабул қилинган медиа: {media_count}.\n'
+            + 'Охирги Telegram сўрови: ' + self.get_state('last_poll_success', 'қайд йўқ') + '\n'
+            + 'Охирги қабул қилинган хабар: ' + self.get_state('last_received', 'қайд йўқ') + '\n'
+            + 'Telegram сўров хатоси: ' + self.get_state('last_poll_error', 'йўқ') + '\n'
             + access + '\n' + self.get_state('last_media', 'Охирги медиа қайди йўқ.') + '\n' +
             self.get_state('last_media_error') + '\n' +
             'Охирги расм/видео таҳлили: ' + (datetime.fromtimestamp(int(visual), ZoneInfo('Asia/Tashkent')).isoformat()
@@ -776,6 +779,12 @@ class Bot:
             self.set_state('last_media_error', f'Манба #{source}: автоматик қайта уриниш муваффақиятсиз ({attempts+1}/3).')
 
     def handle(self, m):
+        # Log metadata only: never message contents, file IDs or credentials.
+        kind = next((k for k in ('photo','video','document','voice','audio','text') if m.get(k)), 'other')
+        actual_chat = m.get('chat', {}).get('id')
+        print(f'Incoming message: chat={actual_chat}, message={m.get("message_id")}, kind={kind}, configured_group={actual_chat == self.chat}', flush=True)
+        if actual_chat == self.chat:
+            self.set_state('last_received', f'{int(time.time())}: #{m.get("message_id")} {kind}')
         if m.get('from',{}).get('is_bot'):
             return
         text = m.get('text', '')
@@ -872,6 +881,8 @@ class Bot:
                 row = self.db.execute("SELECT value FROM state WHERE key='offset'").fetchone()
                 updates = self.tg('getUpdates',offset=int(row[0]) if row else 0,
                                   timeout=40,allowed_updates=['message'])
+                self.set_state('last_poll_success', int(time.time()))
+                self.set_state('last_poll_error', '')
                 for update in updates:
                     m = update.get('message')
                     try:
@@ -906,8 +917,12 @@ class Bot:
                     if self.get_state('service_warning') != key:
                         self.send(str(err))
                         self.set_state('service_warning', key)
-            except Exception:
-                print('Polling temporarily failed; retrying.',flush=True)
+            except Exception as err:
+                # HTTP status distinguishes Telegram authorization/conflicts
+                # without exposing the token embedded in request URLs.
+                detail = f'HTTP {err.code}' if isinstance(err, urllib.error.HTTPError) else type(err).__name__
+                self.set_state('last_poll_error', detail)
+                print(f'Polling temporarily failed ({detail}); retrying.',flush=True)
                 time.sleep(10)
 
 if __name__ == '__main__':
