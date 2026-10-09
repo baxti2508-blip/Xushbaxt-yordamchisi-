@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -57,10 +58,10 @@ def response_text(result):
 class Bot:
     def __init__(self):
         self.token = os.environ['TELEGRAM_BOT_TOKEN']
-        self.key = os.environ['OPENAI_API_KEY']
+        self.key = os.getenv('OPENAI_API_KEY', '')
         self.chat = int(os.getenv('TELEGRAM_CHAT_ID') or '0')
         self.owner = int(os.getenv('OWNER_TELEGRAM_USER_ID') or '0')
-        self.model = os.environ['OPENAI_MODEL']
+        self.model = os.getenv('OPENAI_MODEL', '')
         self.max_calls = int(os.getenv('MAX_DAILY_CALLS', '10'))
         # The owner requested automatic monitoring of the configured group.
         self.auto = True
@@ -89,6 +90,8 @@ class Bot:
                 question TEXT, answer_message INTEGER, answered_by INTEGER);
             CREATE TABLE IF NOT EXISTS dialogue(
                 message INTEGER PRIMARY KEY, source INTEGER, role TEXT, text TEXT);
+            CREATE TABLE IF NOT EXISTS work_queue(
+                update_id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS media_queue(
                 message INTEGER PRIMARY KEY, payload TEXT, retry_at INTEGER,
                 attempts INTEGER DEFAULT 1);
@@ -117,7 +120,8 @@ class Bot:
             return json.load(r)
 
     def tg(self, method, **params):
-        r = self.request(f'https://api.telegram.org/bot{self.token}/{method}', params)
+        r = self.request(f'https://api.telegram.org/bot{self.token}/{method}', params,
+                         timeout=50 if method == 'getUpdates' else 10)
         if not r.get('ok'):
             raise RuntimeError('Telegram request failed')
         return r['result']
@@ -240,6 +244,10 @@ class Bot:
         self.db.commit()
 
     def ai(self, content, report=False, dialogue=False):
+        if not self.key or not self.model:
+            message = 'OpenAI созланмаган: Render OPENAI_API_KEY ва OPENAI_MODEL ни текширинг.'
+            self.set_state('last_error', message)
+            raise ServiceError(message)
         if dialogue:
             day = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
             key = 'dialogue_attempts:' + day
@@ -680,7 +688,11 @@ class Bot:
         try:
             me = self.tg('getMe')
             member = self.tg('getChatMember', chat_id=self.chat, user_id=me['id'])
-            if member.get('status') in ('administrator', 'creator') or me.get('can_read_all_group_messages'):
+            if member.get('status') in ('left', 'kicked'):
+                access = 'Telegram: бот гуруҳ аъзоси эмас ёки чиқарилган.'
+            elif member.get('status') == 'restricted' and not member.get('can_send_messages'):
+                access = 'Telegram: ботга гуруҳда хабар юбориш тақиқланган.'
+            elif member.get('status') in ('administrator', 'creator') or me.get('can_read_all_group_messages'):
                 access = 'Telegram: бот оддий гуруҳ хабарларини олиши мумкин.'
             else:
                 access = ('Telegram: Privacy Mode ёқилган. Автоматик медиа олиш учун '
@@ -692,7 +704,12 @@ class Bot:
         success = self.get_state('last_ai_success')
         visual = self.get_state('last_visual_success')
         media_count = self.db.execute("SELECT count(*) FROM events WHERE kind='media_received'").fetchone()[0]
-        self.send('Кузатув ёқилган. Ботга етиб келган янги хабарлар қайд қилинади.\n'
+        version = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:10]
+        pending = self.db.execute('SELECT count(*) FROM work_queue').fetchone()[0]
+        self.send(f'Код SHA256: {version}; иш навбати: {pending}.\n'
+            + ('OpenAI созламаси бор (ҳақиқий API синови эмас).\n' if self.key and self.model else 'OpenAI калит ёки модель созланмаган.\n')
+            + 'Worker: ' + self.get_state('worker_activity', 'қайд йўқ') + '\n'
+            + 'Кузатув ёқилган. Ботга етиб келган янги хабарлар қайд қилинади.\n'
             f'Бугун AI сўровлари: {row[0] if row else 0}/{self.max_calls}.\n'
             f'Савол-жавоб сўровлари: {self.get_state("dialogue_attempts:" + day, "0")}; ботда кунлик чеклов йўқ.\n'
             'Кунлик ҳисобот: 20:00. Ҳафталик: жума 19:00. Тошкент вақти.\n'
@@ -778,13 +795,17 @@ class Bot:
         except Exception:
             self.set_state('last_media_error', f'Манба #{source}: автоматик қайта уриниш муваффақиятсиз ({attempts+1}/3).')
 
-    def handle(self, m):
+    def note_received(self, m):
         # Log metadata only: never message contents, file IDs or credentials.
         kind = next((k for k in ('photo','video','document','voice','audio','text') if m.get(k)), 'other')
         actual_chat = m.get('chat', {}).get('id')
         print(f'Incoming message: chat={actual_chat}, message={m.get("message_id")}, kind={kind}, configured_group={actual_chat == self.chat}', flush=True)
         if actual_chat == self.chat:
             self.set_state('last_received', f'{int(time.time())}: #{m.get("message_id")} {kind}')
+
+    def handle(self, m, received=True):
+        if received:
+            self.note_received(m)
         if m.get('from',{}).get('is_bot'):
             return
         text = m.get('text', '')
@@ -867,63 +888,153 @@ class Bot:
                 else:
                     self.set_state('last_media', f'Манба #{m["message_id"]}; бот кузатувидан олдинги хабар, автоматик ўтказиб юборилди.')
 
-    def run(self):
-        print(f'Bot starting: chat={self.chat}, owner={self.owner}, model={self.model}, auto={self.auto}', flush=True)
-        if self.tg('getWebhookInfo').get('url'):
-            raise RuntimeError('Existing webhook: remove it deliberately before polling.')
-        while True:
-            try:
+    def dispatch(self, update):
+        """Persist slow work before advancing Telegram's offset; no AI here."""
+        m = update.get('message')
+        if not m:
+            return
+        cmd = command(m.get('text') or m.get('caption', ''))
+        fast = {'/id', '/start', '/help', '/holat', '/vazifa', '/vazifalar',
+                '/bajarildi', '/nuqson', '/nuqsonlar', '/yopildi',
+                '/nazorat', '/tekshirildi'}
+        if cmd in fast:
+            self.handle(m)
+            return
+        self.note_received(m)
+        # Ignore unrelated groups/bots before storing message contents.
+        if (not self.chat or not self.owner or
+                m.get('chat', {}).get('id') != self.chat or
+                m.get('from', {}).get('is_bot')):
+            return
+        if update['update_id'] < int(self.get_state('offset', '0')):
+            return
+        self.db.execute('INSERT OR IGNORE INTO work_queue VALUES(?,?)',
+                        (update['update_id'], json.dumps(m, ensure_ascii=False)))
+        self.db.execute("INSERT OR REPLACE INTO state VALUES('offset',?)",
+                        (str(update['update_id']+1),))
+        self.db.commit()
+
+    def safe_warning(self, text):
+        try:
+            self.send(text)
+        except Exception:
+            print('Telegram warning delivery failed.', flush=True)
+
+    def process_job(self):
+        row = self.db.execute('SELECT update_id,payload FROM work_queue ORDER BY update_id LIMIT 1').fetchone()
+        if not row:
+            return False
+        update_id, payload = row
+        m = json.loads(payload)
+        self.set_state('worker_activity', f'{int(time.time())}: message #{m.get("message_id")}')
+        try:
+            self.handle(m, received=False)
+        except LimitReached:
+            self.set_state('last_media_error', 'Кунлик AI лимити тугаган; медиа қайта ишлаш навбатида қолади.')
+            self.safe_warning('Кунлик AI сўровлари лимити тугади. Эртага давом этамиз.')
+        except (ValueError, ServiceError) as err:
+            # These errors are generated locally with fixed, non-secret messages.
+            self.set_state('last_media_error', str(err)[:500])
+            self.safe_warning(str(err))
+        except Exception:
+            message = 'Таҳлил бажарилмади: файл, тармоқ ёки API босқичида хато.'
+            self.set_state('last_error', message)
+            self.safe_warning(message)
+            print('Background update failed; details redacted.', flush=True)
+        # Automatic media failures remain in the existing retry queue.
+        self.db.execute('DELETE FROM work_queue WHERE update_id=?', (update_id,))
+        self.db.commit()
+        self.set_state('worker_activity', f'{int(time.time())}: idle')
+        return True
+
+    def background(self, stop):
+        # A connection belongs to its own thread. Never share self.db.
+        worker = None
+        try:
+            worker = Bot()
+            while not stop.is_set():
                 try:
-                    self.startup_check()
+                    worker.startup_check()
                 except Exception:
-                    self.set_state('startup_check_retry_at', int(time.time())+300)
+                    worker.set_state('startup_check_retry_at', int(time.time())+300)
                     print('Startup permission check failed; polling continues.', flush=True)
-                row = self.db.execute("SELECT value FROM state WHERE key='offset'").fetchone()
-                updates = self.tg('getUpdates',offset=int(row[0]) if row else 0,
-                                  timeout=40,allowed_updates=['message'])
-                self.set_state('last_poll_success', int(time.time()))
-                self.set_state('last_poll_error', '')
-                for update in updates:
-                    m = update.get('message')
-                    try:
-                        if m:
-                            self.handle(m)
-                    except LimitReached:
-                        if m and any(m.get(k) for k in ('photo','video','document','voice','audio')):
-                            self.set_state('last_media_error', 'Медиа таҳлили: кунлик AI лимити тугаган.')
-                        self.send('Кунлик AI сўровлари лимити тугади. Эртага давом этамиз.')
-                    except (ValueError, ServiceError) as err:
-                        if m and any(m.get(k) for k in ('photo','video','document','voice','audio')):
-                            self.set_state('last_media_error', 'Медиа таҳлили: ' + str(err)[:500])
-                        self.send(str(err))
-                    except Exception:
-                        if m and any(m.get(k) for k in ('photo','video','document','voice','audio')):
-                            self.set_state('last_media_error', 'Медиа таҳлили тугамади: файлни юклаш, кадр/овоз олиш ёки API босқичида хато.')
-                        # Never print URLs, request headers or credentials.
-                        print('Update failed; check credentials, credits, model access and media.', flush=True)
-                        try:
-                            self.send('Таҳлил бажарилмади. Калит, API баланси, модель рухсати ёки файлни текшириш керак.')
-                        except Exception:
-                            pass
-                    self.db.execute("INSERT OR REPLACE INTO state VALUES('offset',?)",(str(update['update_id']+1),))
-                    self.db.commit()
                 try:
-                    self.retry_media()
-                    self.scheduled()
+                    worker.process_job()
+                    worker.set_state('worker_activity', f'{int(time.time())}: scheduled/retry')
+                    worker.retry_media()
+                    worker.scheduled()
                 except LimitReached:
-                    pass  # Text remains queued; avoid repeated limit messages.
+                    pass
                 except ServiceError as err:
-                    key = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
-                    if self.get_state('service_warning') != key:
-                        self.send(str(err))
-                        self.set_state('service_warning', key)
-            except Exception as err:
-                # HTTP status distinguishes Telegram authorization/conflicts
-                # without exposing the token embedded in request URLs.
-                detail = f'HTTP {err.code}' if isinstance(err, urllib.error.HTTPError) else type(err).__name__
-                self.set_state('last_poll_error', detail)
-                print(f'Polling temporarily failed ({detail}); retrying.',flush=True)
-                time.sleep(10)
+                    day = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
+                    if worker.get_state('service_warning') != day:
+                        worker.safe_warning(str(err))
+                        worker.set_state('service_warning', day)
+                except Exception:
+                    worker.set_state('last_error', 'Фон ишида хато; кейинги циклда давом этади.')
+                    print('Background work failed; details redacted.', flush=True)
+                stop.wait(1)
+        except Exception:
+            print('Background worker stopped unexpectedly; details redacted.', flush=True)
+        finally:
+            if worker:
+                worker.db.close()
+
+    def prepare_polling(self):
+        info = self.tg('getWebhookInfo')
+        if info.get('url'):
+            if os.getenv('DELETE_WEBHOOK_ON_START', 'false').lower() == 'true':
+                # Explicit opt-in only, and preserve pending Telegram messages.
+                self.tg('deleteWebhook', drop_pending_updates=False)
+                if self.tg('getWebhookInfo').get('url'):
+                    raise ServiceError('Telegram webhook ҳали фаол; polling бошланмади.')
+            else:
+                message = ('Telegram webhook фаол; polling бошланмади. Pollingга ўтиш учун '
+                           'Render DELETE_WEBHOOK_ON_START=true ни аниқ белгиланг.')
+                self.set_state('last_poll_error', message)
+                raise ServiceError(message)
+
+    def run(self):
+        version = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:10]
+        print(f'Bot starting: code_sha256={version}, chat={self.chat}, owner={self.owner}', flush=True)
+        self.prepare_polling()
+        stop = threading.Event()
+        thread = threading.Thread(target=self.background, args=(stop,), daemon=True)
+        thread.start()
+        try:
+            while True:
+                try:
+                    if not thread.is_alive():
+                        raise ServiceError('Background worker stopped; restart required.')
+                    offset = int(self.get_state('offset', '0'))
+                    updates = self.tg('getUpdates', offset=offset,
+                                      timeout=40, allowed_updates=['message'])
+                    self.set_state('last_poll_success', int(time.time()))
+                    self.set_state('last_poll_error', '')
+                    for update in updates:
+                        self.dispatch(update)
+                        self.set_state('offset', update['update_id']+1)
+                except ServiceError:
+                    raise
+                except Exception as err:
+                    # Never expose URLs containing the Telegram token.
+                    detail = f'HTTP {err.code}' if isinstance(err, urllib.error.HTTPError) else type(err).__name__
+                    if detail == 'HTTP 409':
+                        detail += ': competing poller or active webhook; run one instance'
+                    elif detail == 'HTTP 401':
+                        detail += ': Telegram token rejected'
+                    self.set_state('last_poll_error', detail)
+                    print(f'Polling temporarily failed ({detail}); retrying.', flush=True)
+                    stop.wait(10)
+        finally:
+            stop.set()
+            thread.join(timeout=2)
 
 if __name__ == '__main__':
-    Bot().run()
+    try:
+        Bot().run()
+    except Exception as err:
+        # Tracebacks from urllib can contain token URLs. Do not print them.
+        detail = str(err) if isinstance(err, ServiceError) else type(err).__name__
+        print(f'Bot startup stopped: {detail}', flush=True)
+        raise SystemExit(1) from None
