@@ -154,6 +154,62 @@ class Tests(unittest.TestCase):
                 self.assertIn('Паспорт эртага келади', saved)
                 bot.db.close()
 
+    def test_worker_dialogue_reply_is_not_batched_but_remains_status_evidence(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
+                       TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
+                       OPENAI_MODEL='fake', DATA_DIR=d)
+            with patch.dict(os.environ, env):
+                bot = Bot()
+                self.addCleanup(bot.db.close)
+                bot.db.execute('INSERT INTO questions(source,question_message,question) VALUES(100,200,?)',
+                               ('Бетон паспорти борми?',))
+                bot.db.commit()
+                reply = dict(chat={'id':-100123}, **{'from':{'id':2}},
+                             message_id=201, date=bot.started, text='Паспорт эртага келади',
+                             reply_to_message={'message_id':200})
+                now = datetime(2026, 10, 7, 8, tzinfo=ZoneInfo('Asia/Tashkent'))
+                with patch.object(bot, 'send', return_value=202), \
+                     patch.object(bot, 'ai', return_value='Жавоб') as ai:
+                    bot.handle(reply)
+                    ai.assert_called_once()
+                    self.assertEqual(ai.call_args.kwargs, {'dialogue':True})
+                    bot.scheduled(now)
+                    ai.assert_called_once()
+                    self.assertEqual(bot.db.execute(
+                        "SELECT kind FROM events WHERE message=201").fetchall(),
+                        [('clarification_unverified',)])
+                    self.assertEqual(bot.db.execute(
+                        'SELECT answer_message,answered_by FROM questions WHERE source=100').fetchone(),
+                        (201,2))
+                    # Replies to the assistant and duplicate delivery also stay out of the batch.
+                    followup = dict(reply, message_id=203, text='6-қават',
+                                    reply_to_message={'message_id':202})
+                    bot.handle(followup)
+                    bot.handle(followup)
+                    self.assertEqual(ai.call_count, 2)
+                    bot.set_state('text_check', '0')
+                    bot.scheduled(now)
+                    self.assertEqual(ai.call_count, 2)
+                    bot.status()
+                    self.assertTrue(ai.call_args.kwargs['report'])
+                    self.assertIn('clarification_unverified', ai.call_args.args[0][0]['text'])
+                    self.assertIn(reply['text'], ai.call_args.args[0][0]['text'])
+                    # An unrelated reply still enters ordinary monitoring.
+                    ai.reset_mock()
+                    ordinary = dict(reply, message_id=204, text='Бугун газоблок терилди',
+                                    reply_to_message={'message_id':999})
+                    bot.handle(ordinary)
+                    ai.assert_not_called()
+                    bot.set_state('text_check', '0')
+                    bot.scheduled(now)
+                    ai.assert_called_once()
+                    self.assertEqual(ai.call_args.kwargs, {})
+                    prompt = ai.call_args.args[0][0]['text']
+                    self.assertIn(ordinary['text'], prompt)
+                    self.assertNotIn(reply['text'], prompt)
+                    self.assertNotIn(followup['text'], prompt)
+
     def test_defect_owner_evidence_dedup_and_restart(self):
         with tempfile.TemporaryDirectory() as d:
             env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
