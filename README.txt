@@ -15,9 +15,23 @@ Imkoniyatlar
 - /vazifalar — ro'yxat; /bajarildi ID — egasi bajarilganini tasdiqlaydi.
 - /bugun — 1 kunlik hisobot; /holat — AI muvaffaqiyati, xato va kunlik sarflangan so'rovlar.
 - AI tavsiyasi vazifa yaratmaydi va bajarilganligini tasdiqlamaydi.
-- Har kuni Toshkent sanasi bo'yicha maksimum 10 AI urinish (o'zgartirish mumkin).
+- Asosiy AI limiti: har kuni Toshkent sanasi bo'yicha maksimum 10 urinish
+  (MAX_DAILY_CALLS, o'zgartirish mumkin).
   Shundan 2 so'rov hisobotlar uchun saqlanadi. Limitda xabarlar qayd qilinadi,
   matn tahlili navbatda qoladi, yangi media AI tahlili o'tkazib yuborilishi mumkin.
+- Ishchilar bilan Reply orqali AI savol-javobi uchun mustaqil kunlik limit:
+  MAX_DAILY_DIALOGUE_CALLS=10 (bitta guruhdagi barcha ishchilar uchun jami).
+  0 — pullik suhbat AI chaqiruvlarini o'chiradi; faqat manfiy bo'lmagan butun
+  son qabul qilinadi. Sozlamani o'zgartirgach botni qayta ishga tushiring.
+  Bu limit asosiy 10 so'rovni va hisobotlar uchun 2 so'rov zaxirasini sarflamaydi.
+  Hisob SQLite'da saqlanadi, qayta ishga tushishda yo'qolmaydi va Toshkent vaqti
+  bilan 00:00 da yangi kun uchun noldan boshlanadi. Avvalgi versiya yozgan shu
+  kundagi dialogue_attempts ham hisobga olinadi. API xatosi bilan tugagan urinish
+  ham sanaladi; limitda bloklangan xabar hisoblagichni oshirmaydi.
+  Limit tugasa AI chaqirilmaydi, ishchining asl javobi SQLite jurnalida qoladi
+  va qisqa tushuntirish yuboriladi. Bunday javob oddiy matn to'plamiga o'tmaydi
+  va ertasi kuni avtomatik AIga qayta yuborilmaydi; yangi xabarga Reply qilish mumkin.
+  /holat suhbat sarfi/limiti, qoldiq va yangilanish vaqtini alohida ko'rsatadi.
 Bu pul bo'yicha qat'iy limit emas: tokenlar va model narxi xarajatni belgilaydi.
 - Faqat TELEGRAM_CHAT_ID bilan ko'rsatilgan bitta guruhni kuzatadi.
 - baseline.json tasdiqlangan qiymatlar uchun o'zgarmas manba: bot uni yozmaydi.
@@ -49,8 +63,13 @@ Cheklovlar va ma'lumotlar
   Telegram photo yoki JPEG hujjat yuboring.
 - Oxirgi 120 qayd statusga kiritiladi; agar ko'p bo'lsa hisobot to'liq emasligini aytadi.
 - Eski qolib ketgan /tahlil va /status buyruqlari ishga tushganda bajarilishi mumkin.
-- AI chaqiruvi vaqtida server uzilsa takroriy xarajat/javob yuz berishi mumkin.
+- Media/hisobot AI chaqiruvi vaqtida server uzilsa takroriy xarajat/javob yuz berishi mumkin.
   API xatoli update qayta avtomatik bajarilmaydi; /tahlilni qayta yuboring.
+- Suhbat javobi AI chaqiruvidan oldin qayd qilinadi: bir xil Telegram xabari
+  takror kelsa yoki bot qayta ishga tushsa yangi suhbat so'rovi sarflanmaydi.
+  AI yoki Telegram yuborishi uzilsa shu xabar avtomatik takrorlanmaydi.
+  Qayd bilan yuborish orasida uzilish bo'lsa AI javobi kelmasligi mumkin;
+  qayta savol berish uchun yangi Reply yuboring.
 - Kundalik cap katta xarajatni kamaytiradi, aniq dollar budjetini kafolatlamaydi.
 - Maxfiylik: guruhga qaysi ma'lumotlar qayd qilinishi va AIga yuborilishini tushuntiring.
   Matnlar doimiy volume'da qoladi; raw media vaqtinchalik olinib o'chiriladi.
@@ -66,3 +85,6 @@ https://developers.openai.com/api/docs/quickstart
 Sinovlar: test_bot.py — buyruq/caption, kunlik limit va hisobot zaxirasi,
 baseline o'zgarmasligi, guruh/egasi izolyatsiyasi, vazifalar, sana tekshiruvi,
 hisobot takrorlanmasligi, qayta ishga tushishda saqlash, matn navbati.
+test_dialogue_limits.py — mustaqil suhbat limiti, Toshkent 00:00 chegarasi,
+takroriy xabar/xato/restart, saqlangan javob va /holat. Barcha sinovlar:
+python -m unittest -q
