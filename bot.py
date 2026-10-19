@@ -63,6 +63,12 @@ class Bot:
         self.owner = int(os.getenv('OWNER_TELEGRAM_USER_ID') or '0')
         self.model = os.getenv('OPENAI_MODEL', '')
         self.max_calls = int(os.getenv('MAX_DAILY_CALLS', '10'))
+        try:
+            self.max_dialogue_calls = int(os.getenv('MAX_DAILY_DIALOGUE_CALLS', '10'))
+            if self.max_dialogue_calls < 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError('MAX_DAILY_DIALOGUE_CALLS must be a non-negative integer.') from None
         # The owner requested automatic monitoring of the configured group.
         self.auto = True
         root = Path(os.getenv('DATA_DIR', '/data'))
@@ -236,12 +242,25 @@ class Bot:
     def reserve(self, report=False):
         day = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
         n = self.db.execute('SELECT n FROM calls WHERE day=?', (day,)).fetchone()
-        # Leave two daily calls for reports; all calls share the hard cap.
+        # Leave two main-budget calls for reports; dialogue has its own cap.
         cap = self.max_calls if report else max(1, self.max_calls-2)
         if n and n[0] >= cap:
             raise LimitReached()
         self.db.execute('INSERT INTO calls VALUES(?,1) ON CONFLICT(day) DO UPDATE SET n=n+1', (day,))
         self.db.commit()
+
+    def reserve_dialogue(self):
+        day = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
+        key = 'dialogue_attempts:' + day
+        # Reuse existing counts on upgrade. The write transaction makes checking
+        # and incrementing atomic across SQLite connections; commit before AI.
+        with self.db:
+            self.db.execute('INSERT OR IGNORE INTO state VALUES(?,?)', (key, '0'))
+            reserved = self.db.execute('UPDATE state SET value=CAST(value AS INTEGER)+1 '
+                'WHERE key=? AND CAST(value AS INTEGER)<?',
+                (key, self.max_dialogue_calls)).rowcount
+        if not reserved:
+            raise LimitReached()
 
     def ai(self, content, report=False, dialogue=False):
         if not self.key or not self.model:
@@ -249,9 +268,7 @@ class Bot:
             self.set_state('last_error', message)
             raise ServiceError(message)
         if dialogue:
-            day = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
-            key = 'dialogue_attempts:' + day
-            self.set_state(key, int(self.get_state(key, '0')) + 1)
+            self.reserve_dialogue()
         else:
             self.reserve(report)
         try:
@@ -519,10 +536,21 @@ class Bot:
                   json.dumps({'source':source, 'question':initial[0] if initial else '',
                               'unverified_inspection':inspection[0] if inspection else '',
                               'recent_dialogue':history, 'worker_reply':m['text'][:6000]}, ensure_ascii=False))
-        answer = self.ai([{'type':'input_text','text':prompt}], dialogue=True)
+        # Claim the reply durably before either network call. A repeated update
+        # must not spend again, including after API/send failure or a restart.
+        with self.db:
+            claimed = self.db.execute('INSERT OR IGNORE INTO dialogue VALUES(?,?,?,?)',
+                (m['message_id'],source,'user',m['text'][:6000])).rowcount
+        if not claimed:
+            return True
+        try:
+            answer = self.ai([{'type':'input_text','text':prompt}], dialogue=True)
+        except LimitReached:
+            answer = ('Савол-жавоб учун кунлик AI лимити тугади. Жавобингиз сақланди. '
+                      'Лимит Тошкент вақти билан 00:00 да янгиланади.')
+            if self.max_dialogue_calls == 0:
+                answer = 'Савол-жавоб AI созламада ўчирилган. Жавобингиз сақланди.'
         sent = self.send(answer, m['message_id'])
-        self.db.execute('INSERT OR IGNORE INTO dialogue VALUES(?,?,?,?)',
-                        (m['message_id'],source,'user',m['text'][:6000]))
         if isinstance(sent, int):
             self.db.execute('INSERT OR IGNORE INTO dialogue VALUES(?,?,?,?)',
                             (sent,source,'assistant',answer[:6000]))
@@ -703,6 +731,7 @@ class Bot:
             pass
         day = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
         row = self.db.execute('SELECT n FROM calls WHERE day=?', (day,)).fetchone()
+        dialogue_used = int(self.get_state('dialogue_attempts:' + day, '0'))
         success = self.get_state('last_ai_success')
         visual = self.get_state('last_visual_success')
         media_count = self.db.execute("SELECT count(*) FROM events WHERE kind='media_received'").fetchone()[0]
@@ -713,7 +742,9 @@ class Bot:
             + 'Worker: ' + self.get_state('worker_activity', 'қайд йўқ') + '\n'
             + 'Кузатув ёқилган. Ботга етиб келган янги хабарлар қайд қилинади.\n'
             f'Бугун AI сўровлари: {row[0] if row else 0}/{self.max_calls}.\n'
-            f'Савол-жавоб сўровлари: {self.get_state("dialogue_attempts:" + day, "0")}; ботда кунлик чеклов йўқ.\n'
+            f'Савол-жавоб сўровлари: {dialogue_used}/{self.max_dialogue_calls}; '
+            f'қолди: {max(0, self.max_dialogue_calls-dialogue_used)}. '
+            'Мустақил лимит; Тошкент вақти билан 00:00 да янгиланади.\n'
             'Кунлик ҳисобот: 20:00. Ҳафталик: жума 19:00. Тошкент вақти.\n'
             'Газоблок, бетон ва техника хавфсизлиги учун овозли эслатма: ҳар куни 09:00 (Тошкент).\n'
             'Охирги AI натижаси: ' + (datetime.fromtimestamp(int(success), ZoneInfo('Asia/Tashkent')).isoformat()

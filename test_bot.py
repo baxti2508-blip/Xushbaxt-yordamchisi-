@@ -108,17 +108,21 @@ class Tests(unittest.TestCase):
                         self.assertIn('файл катта', send.call_args.args[0])
                 bot.db.close()
 
-    def test_dialogue_bypasses_media_limit_and_counts_attempts(self):
+    def test_dialogue_uses_independent_limit_and_counts_attempts(self):
         with tempfile.TemporaryDirectory() as d:
             env = dict(TELEGRAM_BOT_TOKEN='fake', OPENAI_API_KEY='fake',
                        TELEGRAM_CHAT_ID='-100123', OWNER_TELEGRAM_USER_ID='1',
-                       OPENAI_MODEL='fake', DATA_DIR=d, MAX_DAILY_CALLS='3')
+                       OPENAI_MODEL='fake', DATA_DIR=d, MAX_DAILY_CALLS='3',
+                       MAX_DAILY_DIALOGUE_CALLS='12')
             with patch.dict(os.environ, env):
                 bot = Bot()
                 response = {'output':[{'content':[{'type':'output_text','text':'Жавоб'}]}]}
-                with patch.object(bot, 'request', return_value=response), patch.object(bot, 'reserve') as reserve:
+                with patch.object(bot, 'request', return_value=response) as request, patch.object(bot, 'reserve') as reserve:
                     for _ in range(12):
                         self.assertEqual(bot.ai([{'type':'input_text','text':'Савол'}], dialogue=True), 'Жавоб')
+                    with self.assertRaises(LimitReached):
+                        bot.ai([], dialogue=True)
+                    self.assertEqual(request.call_count, 12)
                     reserve.assert_not_called()
                 day = datetime.now(ZoneInfo('Asia/Tashkent')).date().isoformat()
                 self.assertEqual(bot.get_state('dialogue_attempts:' + day), '12')
